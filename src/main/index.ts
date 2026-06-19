@@ -2,9 +2,10 @@ import { app, BrowserWindow, ipcMain, shell } from "electron";
 import * as path from "path";
 import * as os from "os";
 import * as fs from "fs";
-import { scanSystem, cleanPaths, ScanResult } from "./scanner";
+import { scanSystem, cleanPaths, scanApps, uninstallApp, ScanResult, AppInfo } from "./scanner";
 
 let scanCache: ScanResult[] = [];
+let appCache: AppInfo[] = [];
 
 function createWindow(): void {
   const win = new BrowserWindow({
@@ -112,4 +113,13 @@ ipcMain.handle("get-stats", async () => {
 
 ipcMain.handle("open-path", async (_event, p: string) => {
   if (fs.existsSync(p)) shell.showItemInFolder(p);
+});
+
+ipcMain.handle("scan-apps", async () => {
+  appCache = scanApps();
+  return appCache;
+});
+
+ipcMain.handle("uninstall-app", async (_event, appPath: string, associatedPaths: string[]) => {
+  return uninstallApp(appPath, associatedPaths);
 });

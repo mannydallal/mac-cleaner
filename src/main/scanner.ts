@@ -269,6 +269,122 @@ export function scanSystem(): ScanResult[] {
   return results.sort((a, b) => b.sizeMb - a.sizeMb);
 }
 
+// ── App scanner ───────────────────────────────────────────────────────────────
+
+export type AppInfo = {
+  name: string;
+  appPath: string;
+  bundleId: string;
+  sizeMb: number;
+  associatedPaths: string[];
+  associatedSizeMb: number;
+};
+
+function getAppBundleId(appPath: string): string {
+  try {
+    const plistPath = path.join(appPath, "Contents", "Info.plist");
+    const content = fs.readFileSync(plistPath, "utf-8");
+    const match = content.match(/<key>CFBundleIdentifier<\/key>\s*<string>([^<]+)<\/string>/);
+    return match?.[1] ?? "";
+  } catch {
+    return "";
+  }
+}
+
+function findAssociatedPaths(cleanName: string, bundleId: string): string[] {
+  const home = os.homedir();
+  const found: string[] = [];
+
+  const candidates: string[] = [
+    path.join(home, "Library", "Application Support", cleanName),
+    path.join(home, "Library", "Logs", cleanName),
+    path.join(home, "Library", "Saved Application State", `${bundleId}.savedState`),
+  ];
+
+  if (bundleId) {
+    candidates.push(
+      path.join(home, "Library", "Caches", bundleId),
+      path.join(home, "Library", "Containers", bundleId),
+      path.join(home, "Library", "Application Support", bundleId),
+    );
+  }
+
+  // Scan Preferences for matching plists
+  const prefsDir = path.join(home, "Library", "Preferences");
+  try {
+    const prefs = fs.readdirSync(prefsDir).filter(
+      (f) => (bundleId && f.startsWith(bundleId)) || f.toLowerCase().startsWith(cleanName.toLowerCase())
+    );
+    prefs.forEach((f) => candidates.push(path.join(prefsDir, f)));
+  } catch { /* skip */ }
+
+  for (const p of candidates) {
+    try {
+      if (fs.existsSync(p) && !found.includes(p)) found.push(p);
+    } catch { /* skip */ }
+  }
+
+  return found;
+}
+
+export function scanApps(): AppInfo[] {
+  const results: AppInfo[] = [];
+
+  if (process.platform === "darwin") {
+    const appsDir = "/Applications";
+    try {
+      const entries = fs.readdirSync(appsDir, { withFileTypes: true });
+      for (const entry of entries) {
+        if (!entry.name.endsWith(".app")) continue;
+        const appPath = path.join(appsDir, entry.name);
+        const cleanName = entry.name.replace(/\.app$/, "");
+        const bundleId = getAppBundleId(appPath);
+        const { sizeMb } = getFolderSize(appPath);
+        const associatedPaths = findAssociatedPaths(cleanName, bundleId);
+        const associatedSizeMb = associatedPaths.reduce((sum, p) => {
+          try { return sum + getFolderSize(p).sizeMb; } catch { return sum; }
+        }, 0);
+        results.push({ name: cleanName, appPath, bundleId, sizeMb, associatedPaths, associatedSizeMb });
+      }
+    } catch { /* skip */ }
+  } else if (process.platform === "win32") {
+    const dirs = [
+      "C:\\Program Files",
+      "C:\\Program Files (x86)",
+      path.join(os.homedir(), "AppData", "Local", "Programs"),
+    ];
+    for (const dir of dirs) {
+      try {
+        const entries = fs.readdirSync(dir, { withFileTypes: true });
+        for (const entry of entries) {
+          if (!entry.isDirectory()) continue;
+          const appPath = path.join(dir, entry.name);
+          const { sizeMb } = getFolderSize(appPath);
+          results.push({ name: entry.name, appPath, bundleId: "", sizeMb, associatedPaths: [], associatedSizeMb: 0 });
+        }
+      } catch { /* skip */ }
+    }
+  }
+
+  return results.sort((a, b) => (b.sizeMb + b.associatedSizeMb) - (a.sizeMb + a.associatedSizeMb));
+}
+
+export function uninstallApp(appPath: string, associatedPaths: string[]): { freedMb: number; errors: string[] } {
+  const errors: string[] = [];
+  let freedMb = 0;
+  for (const p of [appPath, ...associatedPaths]) {
+    try {
+      if (!fs.existsSync(p)) continue;
+      const { sizeMb } = getFolderSize(p);
+      fs.rmSync(p, { recursive: true, force: true });
+      freedMb += sizeMb;
+    } catch (e) {
+      errors.push(`Could not remove ${p}: ${String(e)}`);
+    }
+  }
+  return { freedMb, errors };
+}
+
 export function cleanPaths(
   ids: string[],
   scanResults: ScanResult[]
