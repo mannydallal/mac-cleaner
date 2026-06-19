@@ -1,0 +1,566 @@
+import { useState, useEffect, useCallback } from "react";
+
+// ── Types (mirror preload) ────────────────────────────────────────────────────
+
+type ScanResult = {
+  id: string;
+  name: string;
+  category: string;
+  path: string;
+  sizeMb: number;
+  fileCount: number;
+  safe: boolean;
+};
+
+type SystemStats = {
+  platform: string;
+  cpuPercent: number;
+  ramUsedGb: number;
+  ramTotalGb: number;
+  diskUsedGb: number;
+  diskTotalGb: number;
+};
+
+declare global {
+  interface Window {
+    cleaner: {
+      platform: string;
+      scan: () => Promise<ScanResult[]>;
+      clean: (ids: string[]) => Promise<{ freedMb: number; errors: string[] }>;
+      getStats: () => Promise<SystemStats>;
+      openPath: (path: string) => Promise<void>;
+    };
+  }
+}
+
+// ── Constants ─────────────────────────────────────────────────────────────────
+
+const S = {
+  bg: "#111113",
+  sidebar: "#1C1C1E",
+  card: "#242428",
+  card2: "#2C2C2E",
+  border: "rgba(255,255,255,0.07)",
+  text: "#FFFFFF",
+  muted: "#8E8E93",
+  green: "#30D158",
+  orange: "#FF9F0A",
+  blue: "#0A84FF",
+  red: "#FF453A",
+  purple: "#BF5AF2",
+  teal: "#5AC8FA",
+};
+
+type Tab = "smart" | "junk" | "privacy" | "parallels";
+
+const NAV: { id: Tab; label: string; emoji: string; color: string }[] = [
+  { id: "smart",    label: "Smart Scan",   emoji: "🔍", color: S.green  },
+  { id: "junk",     label: "System Junk",  emoji: "🗑", color: S.orange },
+  { id: "privacy",  label: "Privacy",      emoji: "🔒", color: S.blue   },
+  { id: "parallels",label: "Parallels",    emoji: "💻", color: S.purple },
+];
+
+function fmtMb(mb: number): string {
+  if (mb >= 1024) return (mb / 1024).toFixed(1) + " GB";
+  if (mb >= 1) return mb.toFixed(0) + " MB";
+  return (mb * 1024).toFixed(0) + " KB";
+}
+
+function fmtGb(gb: number): string {
+  return gb.toFixed(1) + " GB";
+}
+
+// ── Sub-components ────────────────────────────────────────────────────────────
+
+function SidebarItem({
+  item,
+  active,
+  onClick,
+}: {
+  item: (typeof NAV)[0];
+  active: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: 10,
+        padding: "9px 14px",
+        borderRadius: 9,
+        border: "none",
+        background: active ? "rgba(255,255,255,0.09)" : "transparent",
+        color: active ? S.text : S.muted,
+        cursor: "pointer",
+        width: "100%",
+        textAlign: "left",
+        fontSize: 14,
+        fontWeight: active ? 600 : 400,
+        transition: "all 0.15s",
+      }}
+    >
+      <span
+        style={{
+          width: 28,
+          height: 28,
+          borderRadius: 7,
+          background: active ? item.color + "33" : "rgba(255,255,255,0.06)",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          fontSize: 14,
+          flexShrink: 0,
+        }}
+      >
+        {item.emoji}
+      </span>
+      {item.label}
+    </button>
+  );
+}
+
+function StatRing({
+  percent,
+  label,
+  color,
+  sub,
+}: {
+  percent: number;
+  label: string;
+  color: string;
+  sub: string;
+}) {
+  const r = 38;
+  const circ = 2 * Math.PI * r;
+  const pct = Math.min(Math.max(percent, 0), 100);
+  const dash = (pct / 100) * circ;
+  return (
+    <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 6 }}>
+      <svg width={96} height={96} viewBox="0 0 96 96">
+        <circle cx={48} cy={48} r={r} fill="none" stroke="rgba(255,255,255,0.08)" strokeWidth={7} />
+        <circle
+          cx={48}
+          cy={48}
+          r={r}
+          fill="none"
+          stroke={color}
+          strokeWidth={7}
+          strokeLinecap="round"
+          strokeDasharray={`${dash} ${circ}`}
+          strokeDashoffset={circ / 4}
+          style={{ transition: "stroke-dasharray 0.6s ease" }}
+        />
+        <text x={48} y={52} textAnchor="middle" fill={S.text} fontSize={16} fontWeight={700} fontFamily="-apple-system,sans-serif">
+          {pct}%
+        </text>
+      </svg>
+      <div style={{ textAlign: "center" }}>
+        <div style={{ fontSize: 12, fontWeight: 600, color: S.text }}>{label}</div>
+        <div style={{ fontSize: 11, color: S.muted }}>{sub}</div>
+      </div>
+    </div>
+  );
+}
+
+function CategoryGroup({
+  category,
+  items,
+  selected,
+  onToggle,
+  onReveal,
+}: {
+  category: string;
+  items: ScanResult[];
+  selected: Set<string>;
+  onToggle: (id: string) => void;
+  onReveal: (path: string) => void;
+}) {
+  const total = items.reduce((s, i) => s + i.sizeMb, 0);
+  const allSelected = items.every((i) => selected.has(i.id));
+
+  return (
+    <div style={{ marginBottom: 16 }}>
+      <div
+        style={{
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+          marginBottom: 6,
+          padding: "0 2px",
+        }}
+      >
+        <span style={{ fontSize: 11, fontWeight: 700, color: S.muted, textTransform: "uppercase", letterSpacing: 0.8 }}>
+          {category}
+        </span>
+        <span style={{ fontSize: 11, color: S.muted }}>{fmtMb(total)}</span>
+      </div>
+      <div style={{ background: S.card, borderRadius: 12, overflow: "hidden" }}>
+        {items.map((item, idx) => (
+          <div
+            key={item.id}
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 12,
+              padding: "12px 16px",
+              borderBottom: idx < items.length - 1 ? `1px solid ${S.border}` : "none",
+              cursor: "pointer",
+            }}
+            onClick={() => onToggle(item.id)}
+          >
+            <div
+              style={{
+                width: 18,
+                height: 18,
+                borderRadius: 5,
+                border: `2px solid ${selected.has(item.id) ? S.green : "rgba(255,255,255,0.25)"}`,
+                background: selected.has(item.id) ? S.green : "transparent",
+                flexShrink: 0,
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                transition: "all 0.15s",
+              }}
+            >
+              {selected.has(item.id) && (
+                <svg width={10} height={8} viewBox="0 0 10 8" fill="none">
+                  <path d="M1 4l3 3 5-6" stroke="#fff" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round" />
+                </svg>
+              )}
+            </div>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ fontSize: 14, color: S.text, fontWeight: 500 }}>{item.name}</div>
+              <div style={{ fontSize: 12, color: S.muted, marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                {item.fileCount.toLocaleString()} files
+              </div>
+            </div>
+            <div style={{ textAlign: "right", flexShrink: 0 }}>
+              <div style={{ fontSize: 14, fontWeight: 600, color: item.sizeMb > 100 ? S.orange : S.text }}>
+                {fmtMb(item.sizeMb)}
+              </div>
+              {!item.safe && (
+                <div style={{ fontSize: 10, color: S.orange, marginTop: 2 }}>Review first</div>
+              )}
+            </div>
+            <button
+              onClick={(e) => { e.stopPropagation(); onReveal(item.path); }}
+              style={{
+                background: "rgba(255,255,255,0.06)",
+                border: "none",
+                borderRadius: 6,
+                color: S.muted,
+                fontSize: 11,
+                padding: "4px 8px",
+                cursor: "pointer",
+                flexShrink: 0,
+              }}
+            >
+              Show
+            </button>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ── Main App ──────────────────────────────────────────────────────────────────
+
+export default function App() {
+  const [tab, setTab] = useState<Tab>("smart");
+  const [stats, setStats] = useState<SystemStats | null>(null);
+  const [scanResults, setScanResults] = useState<ScanResult[]>([]);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [scanning, setScanning] = useState(false);
+  const [cleaning, setCleaning] = useState(false);
+  const [freedMb, setFreedMb] = useState(0);
+  const [toast, setToast] = useState<string | null>(null);
+  const [scanDone, setScanDone] = useState(false);
+
+  const platform = window.cleaner?.platform ?? "darwin";
+  const isMac = platform === "darwin";
+
+  const showToast = (msg: string) => {
+    setToast(msg);
+    setTimeout(() => setToast(null), 3500);
+  };
+
+  useEffect(() => {
+    if (!window.cleaner) return;
+    window.cleaner.getStats().then(setStats).catch(console.error);
+    const iv = setInterval(() => {
+      window.cleaner.getStats().then(setStats).catch(console.error);
+    }, 5000);
+    return () => clearInterval(iv);
+  }, []);
+
+  const handleScan = useCallback(async () => {
+    if (!window.cleaner) return;
+    setScanning(true);
+    setScanDone(false);
+    setSelected(new Set());
+    try {
+      const results = await window.cleaner.scan();
+      setScanResults(results);
+      // auto-select safe items
+      const safeIds = new Set(results.filter((r) => r.safe).map((r) => r.id));
+      setSelected(safeIds);
+      setScanDone(true);
+    } finally {
+      setScanning(false);
+    }
+  }, []);
+
+  const handleClean = useCallback(async () => {
+    if (!window.cleaner || selected.size === 0) return;
+    setCleaning(true);
+    try {
+      const result = await window.cleaner.clean(Array.from(selected));
+      setFreedMb((prev) => prev + result.freedMb);
+      const fresh = await window.cleaner.scan();
+      setScanResults(fresh);
+      setSelected(new Set());
+      setScanDone(false);
+      showToast(`Freed ${fmtMb(result.freedMb)}${result.errors.length > 0 ? " (some items could not be deleted)" : ""}`);
+    } finally {
+      setCleaning(false);
+    }
+  }, [selected]);
+
+  const toggleItem = (id: string) => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const revealPath = (path: string) => {
+    window.cleaner?.openPath(path);
+  };
+
+  // Filter results by tab
+  const filteredResults = scanResults.filter((r) => {
+    if (tab === "smart") return true;
+    if (tab === "junk") return r.category === "System Junk" || r.category === "Browser Junk" || r.category === "Developer Junk";
+    if (tab === "privacy") return r.category === "Privacy";
+    if (tab === "parallels") return r.category === "Parallels";
+    return true;
+  });
+
+  const categories = Array.from(new Set(filteredResults.map((r) => r.category)));
+  const selectedMb = scanResults.filter((r) => selected.has(r.id)).reduce((s, r) => s + r.sizeMb, 0);
+  const totalFoundMb = filteredResults.reduce((s, r) => s + r.sizeMb, 0);
+
+  const diskPct = stats ? Math.round((stats.diskUsedGb / stats.diskTotalGb) * 100) : 0;
+  const ramPct = stats ? Math.round((stats.ramUsedGb / stats.ramTotalGb) * 100) : 0;
+
+  return (
+    <div style={{ display: "flex", height: "100vh", background: S.bg, overflow: "hidden", position: "relative" }}>
+
+      {/* Toast */}
+      {toast && (
+        <div style={{
+          position: "fixed", top: 20, left: "50%", transform: "translateX(-50%)",
+          background: S.green, color: "#fff", padding: "10px 20px", borderRadius: 10,
+          fontSize: 14, fontWeight: 600, zIndex: 9999, boxShadow: "0 4px 20px rgba(0,0,0,0.4)",
+        }}>
+          ✓ {toast}
+        </div>
+      )}
+
+      {/* Sidebar */}
+      <div style={{
+        width: 220,
+        background: S.sidebar,
+        display: "flex",
+        flexDirection: "column",
+        padding: "48px 10px 20px",
+        borderRight: `1px solid ${S.border}`,
+        flexShrink: 0,
+      }}>
+        <div style={{ paddingLeft: 6, marginBottom: 20 }}>
+          <div style={{ fontSize: 18, fontWeight: 800, color: S.text, letterSpacing: -0.3 }}>
+            {isMac ? "🍎" : "🪟"} Mac Cleaner
+          </div>
+          {freedMb > 0 && (
+            <div style={{ fontSize: 11, color: S.green, marginTop: 4 }}>
+              {fmtMb(freedMb)} freed this session
+            </div>
+          )}
+        </div>
+
+        <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+          {NAV.map((item) => (
+            <SidebarItem
+              key={item.id}
+              item={item}
+              active={tab === item.id}
+              onClick={() => setTab(item.id)}
+            />
+          ))}
+        </div>
+
+        {/* Stats */}
+        {stats && (
+          <div style={{ marginTop: "auto", display: "flex", flexDirection: "column", gap: 10 }}>
+            <div style={{ height: 1, background: S.border, margin: "0 4px" }} />
+            <div style={{ padding: "10px 6px" }}>
+              <MiniStat label="Disk" used={fmtGb(stats.diskUsedGb)} total={fmtGb(stats.diskTotalGb)} pct={diskPct} color={diskPct > 85 ? S.red : diskPct > 70 ? S.orange : S.green} />
+              <MiniStat label="RAM" used={fmtGb(stats.ramUsedGb)} total={fmtGb(stats.ramTotalGb)} pct={ramPct} color={ramPct > 85 ? S.red : S.blue} />
+              <MiniStat label="CPU" used={`${stats.cpuPercent}%`} total="" pct={stats.cpuPercent} color={stats.cpuPercent > 80 ? S.red : S.teal} />
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Main content */}
+      <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>
+
+        {/* Header */}
+        <div style={{
+          padding: "20px 28px 16px",
+          borderBottom: `1px solid ${S.border}`,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          flexShrink: 0,
+        }}>
+          <div>
+            <div style={{ fontSize: 22, fontWeight: 800, color: S.text }}>
+              {NAV.find((n) => n.id === tab)?.emoji} {NAV.find((n) => n.id === tab)?.label}
+            </div>
+            {scanDone && (
+              <div style={{ fontSize: 13, color: S.muted, marginTop: 3 }}>
+                Found {fmtMb(totalFoundMb)} of junk across {filteredResults.length} categories
+              </div>
+            )}
+          </div>
+          <div style={{ display: "flex", gap: 10 }}>
+            <button
+              onClick={handleScan}
+              disabled={scanning}
+              style={{
+                padding: "9px 20px",
+                borderRadius: 10,
+                border: "none",
+                background: "rgba(255,255,255,0.1)",
+                color: S.text,
+                fontSize: 14,
+                fontWeight: 600,
+                cursor: scanning ? "not-allowed" : "pointer",
+                opacity: scanning ? 0.6 : 1,
+              }}
+            >
+              {scanning ? "Scanning…" : "Scan"}
+            </button>
+            <button
+              onClick={handleClean}
+              disabled={selected.size === 0 || cleaning}
+              style={{
+                padding: "9px 24px",
+                borderRadius: 10,
+                border: "none",
+                background: selected.size > 0 ? S.green : "rgba(255,255,255,0.06)",
+                color: selected.size > 0 ? "#fff" : S.muted,
+                fontSize: 14,
+                fontWeight: 700,
+                cursor: selected.size > 0 && !cleaning ? "pointer" : "not-allowed",
+                transition: "all 0.2s",
+              }}
+            >
+              {cleaning ? "Cleaning…" : selected.size > 0 ? `Clean ${fmtMb(selectedMb)}` : "Clean"}
+            </button>
+          </div>
+        </div>
+
+        {/* Body */}
+        <div style={{ flex: 1, overflow: "auto", padding: "24px 28px" }}>
+
+          {/* Empty / initial state */}
+          {!scanning && !scanDone && (
+            <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "100%", gap: 20 }}>
+              {stats && (
+                <div style={{ display: "flex", gap: 48, marginBottom: 16 }}>
+                  <StatRing percent={diskPct} label="Disk" color={diskPct > 85 ? S.red : diskPct > 70 ? S.orange : S.green} sub={`${fmtGb(stats.diskUsedGb)} / ${fmtGb(stats.diskTotalGb)}`} />
+                  <StatRing percent={ramPct} label="Memory" color={ramPct > 85 ? S.red : S.blue} sub={`${fmtGb(stats.ramUsedGb)} / ${fmtGb(stats.ramTotalGb)}`} />
+                  <StatRing percent={stats.cpuPercent} label="CPU" color={stats.cpuPercent > 80 ? S.red : S.teal} sub={`${stats.cpuPercent}% used`} />
+                </div>
+              )}
+              <div style={{ fontSize: 15, color: S.muted, textAlign: "center" }}>
+                Click <strong style={{ color: S.text }}>Scan</strong> to find junk files on your {isMac ? "Mac" : "PC"}
+              </div>
+            </div>
+          )}
+
+          {/* Scanning spinner */}
+          {scanning && (
+            <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "100%", gap: 16 }}>
+              <div style={{
+                width: 60, height: 60, borderRadius: "50%",
+                border: `4px solid rgba(255,255,255,0.08)`,
+                borderTop: `4px solid ${S.green}`,
+                animation: "spin 0.8s linear infinite",
+              }} />
+              <div style={{ color: S.muted, fontSize: 15 }}>Scanning your {isMac ? "Mac" : "PC"}…</div>
+              <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
+            </div>
+          )}
+
+          {/* Results */}
+          {scanDone && !scanning && (
+            <>
+              {filteredResults.length === 0 ? (
+                <div style={{ textAlign: "center", color: S.muted, marginTop: 80 }}>
+                  <div style={{ fontSize: 48, marginBottom: 16 }}>✨</div>
+                  <div style={{ fontSize: 18, color: S.text, fontWeight: 600 }}>All clean!</div>
+                  <div style={{ fontSize: 14, marginTop: 8 }}>No junk found in this category.</div>
+                </div>
+              ) : (
+                categories.map((cat) => (
+                  <CategoryGroup
+                    key={cat}
+                    category={cat}
+                    items={filteredResults.filter((r) => r.category === cat)}
+                    selected={selected}
+                    onToggle={toggleItem}
+                    onReveal={revealPath}
+                  />
+                ))
+              )}
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function MiniStat({
+  label,
+  used,
+  total,
+  pct,
+  color,
+}: {
+  label: string;
+  used: string;
+  total: string;
+  pct: number;
+  color: string;
+}) {
+  return (
+    <div style={{ marginBottom: 10 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
+        <span style={{ fontSize: 11, color: S.muted }}>{label}</span>
+        <span style={{ fontSize: 11, color: S.muted }}>{used}{total ? ` / ${total}` : ""}</span>
+      </div>
+      <div style={{ height: 4, background: "rgba(255,255,255,0.08)", borderRadius: 2, overflow: "hidden" }}>
+        <div style={{ height: "100%", width: `${pct}%`, background: color, borderRadius: 2, transition: "width 0.4s" }} />
+      </div>
+    </div>
+  );
+}
