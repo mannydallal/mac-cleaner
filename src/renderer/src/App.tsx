@@ -47,10 +47,11 @@ declare global {
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const S = {
-  bg: "#111113",
-  sidebar: "#1C1C1E",
-  card: "#242428",
-  card2: "#2C2C2E",
+  bg: "#0D0D10",
+  bgGrad: "linear-gradient(145deg, #13101A 0%, #0D0D10 60%, #0A1020 100%)",
+  sidebar: "rgba(20,18,28,0.95)",
+  card: "rgba(36,34,44,0.9)",
+  card2: "rgba(44,42,52,0.9)",
   border: "rgba(255,255,255,0.07)",
   text: "#FFFFFF",
   muted: "#8E8E93",
@@ -380,9 +381,13 @@ export default function App() {
     setUninstallingApp(app.appPath);
     try {
       const result = await window.cleaner.uninstallApp(app.appPath, app.associatedPaths);
-      setFreedMb((prev) => prev + result.freedMb);
-      setAppList((prev) => prev.filter((a) => a.appPath !== app.appPath));
-      showToast(`Uninstalled ${app.name} — freed ${fmtMb(result.freedMb)}`);
+      if (result.errors.length > 0) {
+        showToast(`⚠ Could not remove ${app.name}: ${result.errors[0]}`);
+      } else {
+        setFreedMb((prev) => prev + result.freedMb);
+        setAppList((prev) => prev.filter((a) => a.appPath !== app.appPath));
+        showToast(`Moved ${app.name} to Trash — empty Trash to free ${fmtMb(result.freedMb)}`);
+      }
     } finally {
       setUninstallingApp(null);
     }
@@ -417,16 +422,18 @@ export default function App() {
   const isUninstallerTab = tab === "uninstaller";
 
   return (
-    <div style={{ display: "flex", height: "100vh", background: S.bg, overflow: "hidden", position: "relative" }}>
+    <div style={{ display: "flex", height: "100vh", background: S.bgGrad, overflow: "hidden", position: "relative" }}>
 
       {/* Toast */}
       {toast && (
         <div style={{
           position: "fixed", top: 20, left: "50%", transform: "translateX(-50%)",
-          background: S.green, color: "#fff", padding: "10px 20px", borderRadius: 10,
-          fontSize: 14, fontWeight: 600, zIndex: 9999, boxShadow: "0 4px 20px rgba(0,0,0,0.4)",
+          background: toast.startsWith("⚠") ? S.orange : S.green,
+          color: "#fff", padding: "10px 20px", borderRadius: 10,
+          fontSize: 13, fontWeight: 600, zIndex: 9999, boxShadow: "0 4px 20px rgba(0,0,0,0.5)",
+          maxWidth: 420, textAlign: "center",
         }}>
-          ✓ {toast}
+          {toast.startsWith("⚠") ? toast : `✓ ${toast}`}
         </div>
       )}
 
@@ -437,11 +444,11 @@ export default function App() {
           display: "flex", alignItems: "center", justifyContent: "center",
         }}>
           <div style={{ background: S.card, borderRadius: 16, padding: 28, width: 380, boxShadow: "0 20px 60px rgba(0,0,0,0.5)" }}>
-            <div style={{ fontSize: 18, fontWeight: 700, color: S.text, marginBottom: 10 }}>
-              Uninstall {confirmApp.name}?
+            <div style={{ fontSize: 18, fontWeight: 700, color: S.text, marginBottom: 6 }}>
+              Move {confirmApp.name} to Trash?
             </div>
-            <div style={{ fontSize: 14, color: S.muted, marginBottom: 6 }}>
-              This will permanently delete:
+            <div style={{ fontSize: 13, color: S.muted, marginBottom: 12 }}>
+              The following will be moved to Trash. Empty your Trash afterwards to free the space.
             </div>
             <div style={{ fontSize: 13, color: S.text, background: S.card2, borderRadius: 8, padding: "10px 14px", marginBottom: 16 }}>
               <div>• {confirmApp.name}.app ({fmtMb(confirmApp.sizeMb)})</div>
@@ -460,7 +467,7 @@ export default function App() {
                 onClick={() => handleUninstall(confirmApp)}
                 style={{ flex: 1, padding: "10px", borderRadius: 9, border: "none", background: S.red, color: "#fff", fontSize: 14, fontWeight: 700, cursor: "pointer" }}
               >
-                Uninstall
+                Move to Trash
               </button>
             </div>
           </div>
@@ -608,15 +615,44 @@ export default function App() {
           {!isUninstallerTab && (
             <>
               {!scanning && !scanDone && (
-                <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "100%", gap: 20 }}>
+                <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "100%", gap: 24 }}>
+                  {/* Hero graphic */}
+                  <div style={{ position: "relative", width: 140, height: 140, marginBottom: 8 }}>
+                    <svg viewBox="0 0 140 140" width={140} height={140}>
+                      <defs>
+                        <radialGradient id="glow" cx="50%" cy="50%" r="50%">
+                          <stop offset="0%" stopColor={S.purple} stopOpacity={0.4}/>
+                          <stop offset="100%" stopColor={S.purple} stopOpacity={0}/>
+                        </radialGradient>
+                        <linearGradient id="diskGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+                          <stop offset="0%" stopColor="#9b59f0"/>
+                          <stop offset="100%" stopColor="#5a30d0"/>
+                        </linearGradient>
+                      </defs>
+                      <circle cx="70" cy="70" r="68" fill="url(#glow)"/>
+                      <circle cx="70" cy="70" r="52" fill="none" stroke="rgba(255,255,255,0.05)" strokeWidth="1"/>
+                      <circle cx="70" cy="70" r="36" fill="url(#diskGrad)" opacity="0.9"/>
+                      <circle cx="70" cy="70" r="16" fill="rgba(255,255,255,0.12)"/>
+                      <circle cx="70" cy="70" r="8" fill="rgba(255,255,255,0.25)"/>
+                      {/* Orbit dots */}
+                      <circle cx="70" cy="20" r="4" fill={S.green}/>
+                      <circle cx="118" cy="95" r="3" fill={S.orange}/>
+                      <circle cx="22" cy="95" r="3" fill={S.blue}/>
+                    </svg>
+                  </div>
                   {stats && (
-                    <div style={{ display: "flex", gap: 48, marginBottom: 16 }}>
+                    <div style={{ display: "flex", gap: 36, marginBottom: 4 }}>
                       <StatRing percent={diskPct} label="Disk" color={diskPct > 85 ? S.red : diskPct > 70 ? S.orange : S.green} sub={`${fmtGb(stats.diskUsedGb)} / ${fmtGb(stats.diskTotalGb)}`} />
                       <StatRing percent={ramPct} label="Memory" color={ramPct > 85 ? S.red : S.blue} sub={`${fmtGb(stats.ramUsedGb)} / ${fmtGb(stats.ramTotalGb)}`} />
                       <StatRing percent={stats.cpuPercent} label="CPU" color={stats.cpuPercent > 80 ? S.red : S.teal} sub={`${stats.cpuPercent}% used`} />
                     </div>
                   )}
-                  <div style={{ fontSize: 15, color: S.muted, textAlign: "center" }}>
+                  {ramPct > 90 && (
+                    <div style={{ fontSize: 12, color: S.orange, background: S.orange + "18", border: `1px solid ${S.orange}44`, borderRadius: 8, padding: "6px 14px" }}>
+                      ⚠ Memory is nearly full — scanning will help find files to free space
+                    </div>
+                  )}
+                  <div style={{ fontSize: 15, color: S.muted }}>
                     Click <strong style={{ color: S.text }}>Scan</strong> to find junk files
                   </div>
                 </div>

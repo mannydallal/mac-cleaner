@@ -2,7 +2,7 @@ import { app, BrowserWindow, ipcMain, shell } from "electron";
 import * as path from "path";
 import * as os from "os";
 import * as fs from "fs";
-import { scanSystem, cleanPaths, scanApps, uninstallApp, ScanResult, AppInfo } from "./scanner";
+import { scanSystem, cleanPaths, scanApps, getSizeOf, ScanResult, AppInfo } from "./scanner";
 
 let scanCache: ScanResult[] = [];
 let appCache: AppInfo[] = [];
@@ -121,5 +121,16 @@ ipcMain.handle("scan-apps", async () => {
 });
 
 ipcMain.handle("uninstall-app", async (_event, appPath: string, associatedPaths: string[]) => {
-  return uninstallApp(appPath, associatedPaths);
+  const errors: string[] = [];
+  let freedMb = 0;
+  for (const p of [appPath, ...associatedPaths]) {
+    try {
+      if (!fs.existsSync(p)) continue;
+      freedMb += getSizeOf(p);
+      await shell.trashItem(p);
+    } catch (e) {
+      errors.push(`Could not trash ${path.basename(p)}: ${String(e)}`);
+    }
+  }
+  return { freedMb, errors };
 });

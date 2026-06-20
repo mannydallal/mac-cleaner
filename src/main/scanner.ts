@@ -369,20 +369,8 @@ export function scanApps(): AppInfo[] {
   return results.sort((a, b) => (b.sizeMb + b.associatedSizeMb) - (a.sizeMb + a.associatedSizeMb));
 }
 
-export function uninstallApp(appPath: string, associatedPaths: string[]): { freedMb: number; errors: string[] } {
-  const errors: string[] = [];
-  let freedMb = 0;
-  for (const p of [appPath, ...associatedPaths]) {
-    try {
-      if (!fs.existsSync(p)) continue;
-      const { sizeMb } = getFolderSize(p);
-      fs.rmSync(p, { recursive: true, force: true });
-      freedMb += sizeMb;
-    } catch (e) {
-      errors.push(`Could not remove ${p}: ${String(e)}`);
-    }
-  }
-  return { freedMb, errors };
+export function getSizeOf(p: string): number {
+  try { return getFolderSize(p).sizeMb; } catch { return 0; }
 }
 
 export function cleanPaths(
