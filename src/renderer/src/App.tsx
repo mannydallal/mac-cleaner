@@ -92,16 +92,17 @@ const S = {
   teal: "#0078A0",
 };
 
-type Tab = "smart" | "junk" | "privacy" | "parallels" | "uninstaller" | "repair" | "virus";
+type Tab = "scan-all" | "smart" | "junk" | "privacy" | "parallels" | "uninstaller" | "repair" | "virus";
 
 const NAV: { id: Tab; label: string; emoji: string; color: string }[] = [
+  { id: "scan-all",    label: "Scan All",     emoji: "⚡", color: "#7030B0" },
   { id: "smart",       label: "Smart Scan",   emoji: "🔍", color: S.green  },
   { id: "junk",        label: "System Junk",  emoji: "🗑", color: S.orange },
   { id: "privacy",     label: "Privacy",      emoji: "🔒", color: S.blue   },
   { id: "parallels",   label: "Parallels",    emoji: "💻", color: S.purple },
   { id: "uninstaller", label: "Uninstaller",  emoji: "🗂", color: S.red    },
   { id: "repair",      label: "Disk Health",  emoji: "🔧", color: S.teal   },
-  { id: "virus",       label: "Virus Scan",   emoji: "🛡", color: "#FF453A" },
+  { id: "virus",       label: "Virus Scan",   emoji: "🛡", color: "#C42020" },
 ];
 
 function fmtMb(mb: number): string {
@@ -345,6 +346,11 @@ export default function App() {
   const [uninstallingApp, setUninstallingApp] = useState<string | null>(null);
   const [confirmApp, setConfirmApp] = useState<AppInfo | null>(null);
 
+  // Scan All state
+  const [scanningAll, setScanningAll] = useState(false);
+  const [scanAllDone, setScanAllDone] = useState(false);
+  const [fixingAll, setFixingAll] = useState(false);
+
   // Virus scan state
   const [virusResult, setVirusResult] = useState<VirusScanResult | null>(null);
   const [loadingVirus, setLoadingVirus] = useState(false);
@@ -404,6 +410,62 @@ export default function App() {
       setCleaning(false);
     }
   }, [selected]);
+
+  const handleScanAll = useCallback(async () => {
+    if (!window.cleaner) return;
+    setScanningAll(true);
+    setScanAllDone(false);
+    setVirusResult(null);
+    setDiskHealth(null);
+    setScanResults([]);
+    setSelected(new Set());
+    try {
+      const [junkRes, virusRes, diskRes] = await Promise.all([
+        window.cleaner.scan(),
+        window.cleaner.virusScan(),
+        window.cleaner.diskHealth(),
+      ]);
+      setScanResults(junkRes);
+      setSelected(new Set(junkRes.filter((r) => r.safe).map((r) => r.id)));
+      setScanDone(true);
+      setVirusResult(virusRes);
+      setDiskHealth(diskRes);
+      setScanAllDone(true);
+    } finally {
+      setScanningAll(false);
+    }
+  }, []);
+
+  const handleFixAll = useCallback(async () => {
+    if (!window.cleaner) return;
+    setFixingAll(true);
+    try {
+      // 1. Clean junk
+      if (selected.size > 0) {
+        const r = await window.cleaner.clean(Array.from(selected));
+        setFreedMb((prev) => prev + r.freedMb);
+        const fresh = await window.cleaner.scan();
+        setScanResults(fresh);
+        setSelected(new Set());
+      }
+      // 2. Fix broken symlinks
+      if (diskHealth && diskHealth.brokenSymlinks.length > 0) {
+        await window.cleaner.fixSymlinks(diskHealth.brokenSymlinks);
+        const freshDisk = await window.cleaner.diskHealth();
+        setDiskHealth(freshDisk);
+      }
+      // 3. Quarantine all threats
+      if (virusResult && virusResult.threats.length > 0) {
+        for (const t of virusResult.threats) {
+          await window.cleaner.quarantineThreat(t.path);
+        }
+        setVirusResult((prev) => prev ? { ...prev, threats: [], status: "clean" } : null);
+      }
+      showToast("✓ All issues fixed");
+    } finally {
+      setFixingAll(false);
+    }
+  }, [selected, diskHealth, virusResult]);
 
   const handleVirusScan = useCallback(async () => {
     if (!window.cleaner) return;
@@ -644,7 +706,34 @@ export default function App() {
             )}
           </div>
           <div style={{ display: "flex", gap: 10 }}>
-            {tab === "virus" ? (
+            {tab === "scan-all" ? (
+              <div style={{ display: "flex", gap: 8 }}>
+                <button
+                  onClick={handleScanAll}
+                  disabled={scanningAll}
+                  style={{
+                    padding: "9px 20px", borderRadius: 10, border: "none",
+                    background: "#7030B0", color: "#fff", fontSize: 14, fontWeight: 700,
+                    cursor: scanningAll ? "not-allowed" : "pointer", opacity: scanningAll ? 0.6 : 1,
+                  }}
+                >
+                  {scanningAll ? "Scanning…" : scanAllDone ? "Re-scan All" : "⚡ Scan All"}
+                </button>
+                {scanAllDone && (
+                  <button
+                    onClick={handleFixAll}
+                    disabled={fixingAll}
+                    style={{
+                      padding: "9px 20px", borderRadius: 10, border: "none",
+                      background: S.green, color: "#fff", fontSize: 14, fontWeight: 700,
+                      cursor: fixingAll ? "not-allowed" : "pointer", opacity: fixingAll ? 0.6 : 1,
+                    }}
+                  >
+                    {fixingAll ? "Fixing…" : "Fix All Issues"}
+                  </button>
+                )}
+              </div>
+            ) : tab === "virus" ? (
               <button
                 onClick={handleVirusScan}
                 disabled={loadingVirus}
@@ -876,6 +965,183 @@ export default function App() {
                   <div style={{ fontSize: 12, color: S.muted, textAlign: "center", padding: "4px 0 8px" }}>
                     For deeper repairs, use Disk Utility → First Aid, or boot into Recovery Mode (⌘+R on startup)
                   </div>
+
+                </div>
+              )}
+            </>
+          )}
+
+          {/* ── Scan All tab ── */}
+          {tab === "scan-all" && (
+            <>
+              {!scanningAll && !scanAllDone && (
+                <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "100%", gap: 20 }}>
+                  <div style={{ fontSize: 56 }}>⚡</div>
+                  <div style={{ fontSize: 18, fontWeight: 700, color: S.text }}>Full System Scan</div>
+                  <div style={{ fontSize: 14, color: S.muted, textAlign: "center", maxWidth: 360, lineHeight: 1.6 }}>
+                    Runs all scans at once — junk files, virus & malware, disk health, and broken symlinks.
+                  </div>
+                  <div style={{ fontSize: 13, color: S.muted }}>Click <strong style={{ color: "#7030B0" }}>⚡ Scan All</strong> to begin</div>
+                </div>
+              )}
+
+              {scanningAll && (
+                <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "100%", gap: 20 }}>
+                  <div style={{ position: "relative", width: 72, height: 72 }}>
+                    <div style={{ width: 72, height: 72, borderRadius: "50%", border: `5px solid rgba(112,48,176,0.15)`, borderTop: `5px solid #7030B0`, animation: "spin 0.9s linear infinite" }} />
+                    <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
+                  </div>
+                  <div style={{ fontSize: 17, fontWeight: 700, color: S.text }}>Scanning everything…</div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 8, alignItems: "center" }}>
+                    {[["🗑", "Junk files"], ["🛡", "Viruses & malware"], ["🔧", "Disk health"], ["🔗", "Broken symlinks"]].map(([emoji, label]) => (
+                      <div key={label} style={{ fontSize: 13, color: S.muted, display: "flex", alignItems: "center", gap: 6 }}>
+                        <span>{emoji}</span> {label}
+                        <span style={{ width: 8, height: 8, borderRadius: "50%", background: "#7030B0", opacity: 0.6, animation: "pulse 1.2s ease-in-out infinite", display: "inline-block", marginLeft: 4 }} />
+                        <style>{`@keyframes pulse { 0%,100%{opacity:0.3} 50%{opacity:1} }`}</style>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {scanAllDone && !scanningAll && (
+                <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+
+                  {/* Summary row */}
+                  {(() => {
+                    const junkMb = scanResults.reduce((s, r) => s + r.sizeMb, 0);
+                    const threats = virusResult?.threats.length ?? 0;
+                    const symlinks = diskHealth?.brokenSymlinks.length ?? 0;
+                    const smartOk = diskHealth?.smartStatus === "Verified";
+                    const totalIssues = (junkMb > 0 ? 1 : 0) + threats + (symlinks > 0 ? 1 : 0) + (smartOk ? 0 : 1);
+                    return (
+                      <div style={{ background: totalIssues === 0 ? S.green + "18" : "#7030B018", border: `1px solid ${totalIssues === 0 ? S.green + "44" : "#7030B044"}`, borderRadius: 14, padding: "18px 24px", display: "flex", alignItems: "center", gap: 16 }}>
+                        <div style={{ fontSize: 34 }}>{totalIssues === 0 ? "✅" : "⚠️"}</div>
+                        <div style={{ flex: 1 }}>
+                          <div style={{ fontSize: 16, fontWeight: 700, color: S.text }}>
+                            {totalIssues === 0 ? "Your Mac is clean!" : `${totalIssues} issue${totalIssues !== 1 ? "s" : ""} found`}
+                          </div>
+                          <div style={{ fontSize: 13, color: S.muted, marginTop: 3 }}>
+                            {junkMb > 0 && `${fmtMb(junkMb)} junk  `}
+                            {threats > 0 && `${threats} threat${threats !== 1 ? "s" : ""}  `}
+                            {symlinks > 0 && `${symlinks} broken symlink${symlinks !== 1 ? "s" : ""}  `}
+                            {!smartOk && diskHealth && `Drive: ${diskHealth.smartStatus}`}
+                            {totalIssues === 0 && "No junk, no threats, disk is healthy"}
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })()}
+
+                  {/* Junk row */}
+                  {(() => {
+                    const junkMb = scanResults.reduce((s, r) => s + r.sizeMb, 0);
+                    return (
+                      <div style={{ background: S.card, borderRadius: 14, padding: "16px 20px", display: "flex", alignItems: "center", gap: 14 }}>
+                        <div style={{ width: 42, height: 42, borderRadius: 12, background: S.orange + "22", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 22, flexShrink: 0 }}>🗑</div>
+                        <div style={{ flex: 1 }}>
+                          <div style={{ fontSize: 15, fontWeight: 700, color: S.text }}>System Junk</div>
+                          <div style={{ fontSize: 13, color: S.muted, marginTop: 2 }}>
+                            {junkMb > 0 ? `${fmtMb(junkMb)} across ${scanResults.length} items` : "Nothing to clean"}
+                          </div>
+                        </div>
+                        {junkMb > 0 && (
+                          <button
+                            onClick={async () => {
+                              if (!window.cleaner || selected.size === 0) return;
+                              const r = await window.cleaner.clean(Array.from(selected));
+                              setFreedMb(p => p + r.freedMb);
+                              const fresh = await window.cleaner.scan();
+                              setScanResults(fresh);
+                              setSelected(new Set());
+                              showToast(`Freed ${fmtMb(r.freedMb)}`);
+                            }}
+                            style={{ padding: "7px 16px", borderRadius: 8, border: "none", background: S.orange + "22", color: S.orange, fontSize: 13, fontWeight: 600, cursor: "pointer", flexShrink: 0 }}
+                          >
+                            Clean
+                          </button>
+                        )}
+                        {junkMb === 0 && <div style={{ fontSize: 20 }}>✅</div>}
+                      </div>
+                    );
+                  })()}
+
+                  {/* Virus row */}
+                  {virusResult && (
+                    <div style={{ background: S.card, borderRadius: 14, padding: "16px 20px", display: "flex", alignItems: "center", gap: 14 }}>
+                      <div style={{ width: 42, height: 42, borderRadius: 12, background: S.red + "22", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 22, flexShrink: 0 }}>🛡</div>
+                      <div style={{ flex: 1 }}>
+                        <div style={{ fontSize: 15, fontWeight: 700, color: S.text }}>Virus & Malware</div>
+                        <div style={{ fontSize: 13, color: S.muted, marginTop: 2 }}>
+                          {virusResult.threats.length > 0 ? `${virusResult.threats.length} threat${virusResult.threats.length !== 1 ? "s" : ""} detected` : "No threats found"}
+                        </div>
+                        {virusResult.threats.length > 0 && (
+                          <div style={{ marginTop: 8, display: "flex", flexDirection: "column", gap: 4 }}>
+                            {virusResult.threats.slice(0, 3).map((t, i) => (
+                              <div key={i} style={{ fontSize: 12, color: S.red, display: "flex", alignItems: "center", gap: 6 }}>
+                                <span style={{ width: 6, height: 6, borderRadius: "50%", background: S.red, flexShrink: 0, display: "inline-block" }} />
+                                {t.name} — {t.severity}
+                              </div>
+                            ))}
+                            {virusResult.threats.length > 3 && <div style={{ fontSize: 12, color: S.muted }}>…and {virusResult.threats.length - 3} more</div>}
+                          </div>
+                        )}
+                      </div>
+                      <div style={{ display: "flex", flexDirection: "column", gap: 6, flexShrink: 0 }}>
+                        {virusResult.threats.length > 0 && (
+                          <button
+                            onClick={async () => {
+                              if (!window.cleaner || !virusResult) return;
+                              for (const t of virusResult.threats) await window.cleaner.quarantineThreat(t.path);
+                              setVirusResult(p => p ? { ...p, threats: [], status: "clean" } : null);
+                              showToast("All threats quarantined");
+                            }}
+                            style={{ padding: "7px 14px", borderRadius: 8, border: "none", background: S.red + "22", color: S.red, fontSize: 13, fontWeight: 600, cursor: "pointer" }}
+                          >
+                            Quarantine All
+                          </button>
+                        )}
+                        {virusResult.threats.length === 0 && <div style={{ fontSize: 20 }}>✅</div>}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Disk health row */}
+                  {diskHealth && (
+                    <div style={{ background: S.card, borderRadius: 14, padding: "16px 20px", display: "flex", alignItems: "center", gap: 14 }}>
+                      <div style={{ width: 42, height: 42, borderRadius: 12, background: S.teal + "22", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 22, flexShrink: 0 }}>🔧</div>
+                      <div style={{ flex: 1 }}>
+                        <div style={{ fontSize: 15, fontWeight: 700, color: S.text }}>Disk Health</div>
+                        <div style={{ fontSize: 13, color: S.muted, marginTop: 2 }}>
+                          {diskHealth.volumeName} — S.M.A.R.T. {diskHealth.smartStatus} · {diskHealth.freeGb.toFixed(1)} GB free
+                        </div>
+                        {diskHealth.brokenSymlinks.length > 0 && (
+                          <div style={{ fontSize: 12, color: S.orange, marginTop: 4 }}>
+                            {diskHealth.brokenSymlinks.length} broken symlink{diskHealth.brokenSymlinks.length !== 1 ? "s" : ""}
+                          </div>
+                        )}
+                      </div>
+                      <div style={{ display: "flex", flexDirection: "column", gap: 6, alignItems: "flex-end", flexShrink: 0 }}>
+                        <div style={{ fontSize: 11, fontWeight: 700, padding: "3px 10px", borderRadius: 12, background: diskHealth.smartStatus === "Verified" ? S.green + "22" : S.red + "22", color: diskHealth.smartStatus === "Verified" ? S.green : S.red }}>
+                          {diskHealth.smartStatus}
+                        </div>
+                        {diskHealth.brokenSymlinks.length > 0 && (
+                          <button
+                            onClick={async () => {
+                              if (!window.cleaner || !diskHealth) return;
+                              await window.cleaner.fixSymlinks(diskHealth.brokenSymlinks);
+                              const fresh = await window.cleaner.diskHealth();
+                              setDiskHealth(fresh);
+                              showToast(`Fixed ${diskHealth.brokenSymlinks.length} symlinks`);
+                            }}
+                            style={{ padding: "5px 12px", borderRadius: 7, border: "none", background: S.teal + "22", color: S.teal, fontSize: 12, fontWeight: 600, cursor: "pointer" }}
+                          >
+                            Fix Symlinks
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  )}
 
                 </div>
               )}
