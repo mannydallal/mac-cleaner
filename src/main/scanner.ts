@@ -411,56 +411,104 @@ function findBrokenSymlinks(dir: string, maxDepth = 3, maxFound = 100): string[]
 
 export function getDiskHealth(): DiskHealth {
   let smartStatus = "Unknown";
-  let volumeName = "Macintosh HD";
-  let fileSystem = "APFS";
+  let volumeName = "";
+  let fileSystem = "";
   let totalGb = 0;
   let freeGb = 0;
+  const { execSync } = require("child_process") as typeof import("child_process");
 
   if (process.platform === "darwin") {
+    // ── Mac: diskutil ──────────────────────────────────────────
     try {
-      const { execSync } = require("child_process") as typeof import("child_process");
       const out = execSync("diskutil info /", { encoding: "utf-8", timeout: 8000 }) as string;
-      const smart = out.match(/S\.M\.A\.R\.T\. Status:\s*(.+)/);
-      const vol = out.match(/Volume Name:\s*(.+)/);
+      const smart  = out.match(/S\.M\.A\.R\.T\. Status:\s*(.+)/);
+      const vol    = out.match(/Volume Name:\s*(.+)/);
       const fsLine = out.match(/Type \(Bundle\):\s*(.+)/);
-      if (smart) smartStatus = smart[1].trim();
-      if (vol) volumeName = vol[1].trim();
-      if (fsLine) fileSystem = fsLine[1].trim();
+      if (smart)  smartStatus = smart[1].trim();
+      if (vol)    volumeName  = vol[1].trim();
+      if (fsLine) fileSystem  = fsLine[1].trim();
     } catch { /* skip */ }
 
     try {
-      const { execSync } = require("child_process") as typeof import("child_process");
       const df = (execSync("df -k /", { encoding: "utf-8" }) as string).split("\n")[1].trim().split(/\s+/);
       totalGb = (parseInt(df[1]) * 1024) / 1e9;
-      freeGb = (parseInt(df[3]) * 1024) / 1e9;
+      freeGb  = (parseInt(df[3]) * 1024) / 1e9;
+    } catch { /* skip */ }
+
+  } else if (process.platform === "win32") {
+    // ── Windows: wmic ──────────────────────────────────────────
+    // SMART status
+    try {
+      const out = execSync("wmic diskdrive get status /value", { encoding: "utf-8", timeout: 10000 }) as string;
+      const match = out.match(/Status=(\w+)/i);
+      smartStatus = match ? (match[1] === "OK" ? "Verified" : match[1]) : "Unknown";
+    } catch { /* skip */ }
+
+    // Volume info for C:
+    try {
+      const out = execSync(
+        'wmic logicaldisk where DeviceID="C:" get Size,FreeSpace,FileSystem,VolumeName /value',
+        { encoding: "utf-8", timeout: 10000 }
+      ) as string;
+      const fsMatch   = out.match(/FileSystem=(\w+)/i);
+      const freeMatch = out.match(/FreeSpace=(\d+)/i);
+      const sizeMatch = out.match(/Size=(\d+)/i);
+      const nameMatch = out.match(/VolumeName=([^\r\n]+)/i);
+      if (fsMatch)   fileSystem = fsMatch[1];
+      volumeName  = nameMatch?.[1]?.trim() || "Local Disk (C:)";
+      if (sizeMatch) totalGb = parseInt(sizeMatch[1]) / 1e9;
+      if (freeMatch) freeGb  = parseInt(freeMatch[1]) / 1e9;
     } catch { /* skip */ }
   }
 
+  // ── Broken symlinks (cross-platform) ───────────────────────
   const home = os.homedir();
-  const symlinkDirs = [
-    path.join(home, "Library", "Application Support"),
-    "/usr/local/bin",
-    "/usr/local/lib",
-    "/opt/homebrew/bin",
-  ];
+  const symlinkDirs = process.platform === "darwin"
+    ? [
+        path.join(home, "Library", "Application Support"),
+        "/usr/local/bin",
+        "/usr/local/lib",
+        "/opt/homebrew/bin",
+      ]
+    : [
+        path.join(home, "AppData", "Roaming"),
+        path.join(home, "AppData", "Local"),
+        "C:\\Program Files",
+        "C:\\Program Files (x86)",
+      ];
+
   const brokenSymlinks: string[] = [];
   for (const d of symlinkDirs) {
     if (fs.existsSync(d)) brokenSymlinks.push(...findBrokenSymlinks(d, 2, 100 - brokenSymlinks.length));
     if (brokenSymlinks.length >= 100) break;
   }
 
-  return { smartStatus, volumeName, fileSystem, totalGb, freeGb, brokenSymlinks };
+  return { smartStatus, volumeName: volumeName || "System Drive", fileSystem: fileSystem || "Unknown", totalGb, freeGb, brokenSymlinks };
 }
 
 export function verifyDiskVolume(): string {
-  if (process.platform !== "darwin") return "Volume verification is only supported on macOS.";
-  try {
-    const { execSync } = require("child_process") as typeof import("child_process");
-    return execSync("diskutil verifyVolume /", { encoding: "utf-8", timeout: 120000 }) as string;
-  } catch (e: unknown) {
-    const err = e as { stdout?: string; message?: string };
-    return err.stdout ?? err.message ?? String(e);
+  const { execSync } = require("child_process") as typeof import("child_process");
+
+  if (process.platform === "darwin") {
+    try {
+      return execSync("diskutil verifyVolume /", { encoding: "utf-8", timeout: 120000 }) as string;
+    } catch (e: unknown) {
+      const err = e as { stdout?: string; message?: string };
+      return err.stdout ?? err.message ?? String(e);
+    }
+
+  } else if (process.platform === "win32") {
+    // chkdsk C: with no flags = read-only check, no admin required
+    try {
+      return execSync("chkdsk C:", { encoding: "utf-8", timeout: 120000 }) as string;
+    } catch (e: unknown) {
+      // chkdsk exits non-zero when it finds issues but still prints the report
+      const err = e as { stdout?: string; stderr?: string; message?: string };
+      return err.stdout || err.stderr || err.message || String(e);
+    }
   }
+
+  return "Disk verification is not supported on this platform.";
 }
 
 export function cleanPaths(
