@@ -2,7 +2,7 @@ import { app, BrowserWindow, ipcMain, shell } from "electron";
 import * as path from "path";
 import * as os from "os";
 import * as fs from "fs";
-import { scanSystem, cleanPaths, scanApps, getSizeOf, getDiskHealth, verifyDiskVolume, ScanResult, AppInfo } from "./scanner";
+import { scanSystem, cleanPaths, scanApps, getSizeOf, getDiskHealth, verifyDiskVolume, virusScan, ScanResult, AppInfo } from "./scanner";
 
 let scanCache: ScanResult[] = [];
 let appCache: AppInfo[] = [];
@@ -142,6 +142,22 @@ ipcMain.handle("fix-symlinks", async (_event, paths: string[]) => {
     }
   }
   return { fixed, errors };
+});
+
+ipcMain.handle("virus-scan", async () => {
+  return virusScan();
+});
+
+ipcMain.handle("quarantine-threat", async (_event, threatPath: string) => {
+  try {
+    if (!fs.existsSync(threatPath) && !fs.lstatSync(threatPath).isSymbolicLink()) {
+      return { ok: false, error: "File not found" };
+    }
+    await shell.trashItem(threatPath);
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
 });
 
 ipcMain.handle("uninstall-app", async (_event, appPath: string, associatedPaths: string[]) => {

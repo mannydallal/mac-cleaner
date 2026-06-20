@@ -42,6 +42,21 @@ export type DiskHealth = {
   brokenSymlinks: string[];
 };
 
+export type ThreatItem = {
+  path: string;
+  name: string;
+  severity: "critical" | "high" | "medium" | "low";
+  description: string;
+};
+
+export type VirusScanResult = {
+  status: "clean" | "threats_found" | "error";
+  threats: ThreatItem[];
+  scannedCount: number;
+  scanDuration: number;
+  error?: string;
+};
+
 contextBridge.exposeInMainWorld("cleaner", {
   platform: process.platform,
   scan: (): Promise<ScanResult[]> => ipcRenderer.invoke("scan"),
@@ -55,4 +70,7 @@ contextBridge.exposeInMainWorld("cleaner", {
   verifyDisk: (): Promise<string> => ipcRenderer.invoke("verify-disk"),
   fixSymlinks: (paths: string[]): Promise<{ fixed: number; errors: string[] }> =>
     ipcRenderer.invoke("fix-symlinks", paths),
+  virusScan: (): Promise<VirusScanResult> => ipcRenderer.invoke("virus-scan"),
+  quarantineThreat: (threatPath: string): Promise<{ ok: boolean; error?: string }> =>
+    ipcRenderer.invoke("quarantine-threat", threatPath),
 });

@@ -39,6 +39,21 @@ type DiskHealth = {
   brokenSymlinks: string[];
 };
 
+type ThreatItem = {
+  path: string;
+  name: string;
+  severity: "critical" | "high" | "medium" | "low";
+  description: string;
+};
+
+type VirusScanResult = {
+  status: "clean" | "threats_found" | "error";
+  threats: ThreatItem[];
+  scannedCount: number;
+  scanDuration: number;
+  error?: string;
+};
+
 declare global {
   interface Window {
     cleaner: {
@@ -52,6 +67,8 @@ declare global {
       diskHealth: () => Promise<DiskHealth>;
       verifyDisk: () => Promise<string>;
       fixSymlinks: (paths: string[]) => Promise<{ fixed: number; errors: string[] }>;
+      virusScan: () => Promise<VirusScanResult>;
+      quarantineThreat: (threatPath: string) => Promise<{ ok: boolean; error?: string }>;
     };
   }
 }
@@ -75,7 +92,7 @@ const S = {
   teal: "#5AC8FA",
 };
 
-type Tab = "smart" | "junk" | "privacy" | "parallels" | "uninstaller" | "repair";
+type Tab = "smart" | "junk" | "privacy" | "parallels" | "uninstaller" | "repair" | "virus";
 
 const NAV: { id: Tab; label: string; emoji: string; color: string }[] = [
   { id: "smart",       label: "Smart Scan",   emoji: "🔍", color: S.green  },
@@ -84,6 +101,7 @@ const NAV: { id: Tab; label: string; emoji: string; color: string }[] = [
   { id: "parallels",   label: "Parallels",    emoji: "💻", color: S.purple },
   { id: "uninstaller", label: "Uninstaller",  emoji: "🗂", color: S.red    },
   { id: "repair",      label: "Disk Health",  emoji: "🔧", color: S.teal   },
+  { id: "virus",       label: "Virus Scan",   emoji: "🛡", color: "#FF453A" },
 ];
 
 function fmtMb(mb: number): string {
@@ -327,6 +345,11 @@ export default function App() {
   const [uninstallingApp, setUninstallingApp] = useState<string | null>(null);
   const [confirmApp, setConfirmApp] = useState<AppInfo | null>(null);
 
+  // Virus scan state
+  const [virusResult, setVirusResult] = useState<VirusScanResult | null>(null);
+  const [loadingVirus, setLoadingVirus] = useState(false);
+  const [quarantining, setQuarantining] = useState<string | null>(null);
+
   // Disk health state
   const [diskHealth, setDiskHealth] = useState<DiskHealth | null>(null);
   const [loadingHealth, setLoadingHealth] = useState(false);
@@ -381,6 +404,34 @@ export default function App() {
       setCleaning(false);
     }
   }, [selected]);
+
+  const handleVirusScan = useCallback(async () => {
+    if (!window.cleaner) return;
+    setLoadingVirus(true);
+    setVirusResult(null);
+    try {
+      const result = await window.cleaner.virusScan();
+      setVirusResult(result);
+    } finally {
+      setLoadingVirus(false);
+    }
+  }, []);
+
+  const handleQuarantine = useCallback(async (threat: ThreatItem) => {
+    if (!window.cleaner) return;
+    setQuarantining(threat.path);
+    try {
+      const result = await window.cleaner.quarantineThreat(threat.path);
+      if (result.ok) {
+        showToast(`Moved "${threat.name}" to Trash`);
+        setVirusResult((prev) => prev ? { ...prev, threats: prev.threats.filter(t => t.path !== threat.path), status: prev.threats.length === 1 ? "clean" : "threats_found" } : null);
+      } else {
+        showToast(`⚠ Could not quarantine: ${result.error}`);
+      }
+    } finally {
+      setQuarantining(null);
+    }
+  }, []);
 
   const handleDiskHealth = useCallback(async () => {
     if (!window.cleaner) return;
@@ -593,7 +644,19 @@ export default function App() {
             )}
           </div>
           <div style={{ display: "flex", gap: 10 }}>
-            {isRepairTab ? (
+            {tab === "virus" ? (
+              <button
+                onClick={handleVirusScan}
+                disabled={loadingVirus}
+                style={{
+                  padding: "9px 20px", borderRadius: 10, border: "none",
+                  background: "rgba(255,255,255,0.1)", color: S.text, fontSize: 14, fontWeight: 600,
+                  cursor: loadingVirus ? "not-allowed" : "pointer", opacity: loadingVirus ? 0.6 : 1,
+                }}
+              >
+                {loadingVirus ? "Scanning…" : "Run Scan"}
+              </button>
+            ) : isRepairTab ? (
               <button
                 onClick={handleDiskHealth}
                 disabled={loadingHealth}
@@ -819,8 +882,110 @@ export default function App() {
             </>
           )}
 
+          {/* ── Virus Scan tab ── */}
+          {tab === "virus" && (
+            <>
+              {!loadingVirus && !virusResult && (
+                <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "100%", gap: 16 }}>
+                  <div style={{ fontSize: 52 }}>🛡</div>
+                  <div style={{ fontSize: 16, fontWeight: 700, color: S.text }}>Virus & Malware Scanner</div>
+                  <div style={{ fontSize: 14, color: S.muted, textAlign: "center", maxWidth: 340 }}>
+                    Scans LaunchAgents, startup folders, and known malware locations.
+                    On Windows, also runs Windows Defender.
+                  </div>
+                  <div style={{ fontSize: 12, color: S.muted, marginTop: 4 }}>Click <strong style={{ color: S.text }}>Run Scan</strong> to start</div>
+                </div>
+              )}
+              {loadingVirus && (
+                <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "100%", gap: 16 }}>
+                  <div style={{ width: 60, height: 60, borderRadius: "50%", border: `4px solid rgba(255,255,255,0.08)`, borderTop: `4px solid #FF453A`, animation: "spin 0.8s linear infinite" }} />
+                  <div style={{ color: S.text, fontSize: 16, fontWeight: 700 }}>Scanning for threats…</div>
+                  <div style={{ color: S.muted, fontSize: 13 }}>
+                    {isMac ? "Checking LaunchAgents, Applications, and known malware paths" : "Running Windows Defender + scanning startup locations"}
+                  </div>
+                  <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
+                </div>
+              )}
+              {virusResult && !loadingVirus && (
+                <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+
+                  {/* Status banner */}
+                  <div style={{
+                    background: virusResult.status === "clean" ? S.green + "18" : virusResult.status === "threats_found" ? "#FF453A18" : S.orange + "18",
+                    border: `1px solid ${virusResult.status === "clean" ? S.green + "44" : virusResult.status === "threats_found" ? "#FF453A44" : S.orange + "44"}`,
+                    borderRadius: 14, padding: "20px 24px", display: "flex", alignItems: "center", gap: 18,
+                  }}>
+                    <div style={{ fontSize: 36, flexShrink: 0 }}>
+                      {virusResult.status === "clean" ? "✅" : virusResult.status === "threats_found" ? "⚠️" : "❓"}
+                    </div>
+                    <div style={{ flex: 1 }}>
+                      <div style={{ fontSize: 16, fontWeight: 700, color: S.text }}>
+                        {virusResult.status === "clean" ? "No threats found" : virusResult.status === "threats_found" ? `${virusResult.threats.length} threat${virusResult.threats.length !== 1 ? "s" : ""} detected` : "Scan error"}
+                      </div>
+                      <div style={{ fontSize: 13, color: S.muted, marginTop: 3 }}>
+                        Scanned {virusResult.scannedCount.toLocaleString()} items in {(virusResult.scanDuration / 1000).toFixed(1)}s
+                        {virusResult.error ? ` — ${virusResult.error}` : ""}
+                      </div>
+                    </div>
+                    <button
+                      onClick={handleVirusScan}
+                      style={{ padding: "7px 16px", borderRadius: 8, border: "none", background: "rgba(255,255,255,0.08)", color: S.text, fontSize: 13, fontWeight: 600, cursor: "pointer", flexShrink: 0 }}
+                    >
+                      Re-scan
+                    </button>
+                  </div>
+
+                  {/* Threats list */}
+                  {virusResult.threats.length > 0 && (
+                    <div style={{ background: S.card, borderRadius: 14, overflow: "hidden" }}>
+                      <div style={{ padding: "14px 20px", borderBottom: `1px solid ${S.border}`, fontSize: 14, fontWeight: 700, color: S.text }}>
+                        Detected Threats
+                      </div>
+                      {virusResult.threats.map((threat, i) => {
+                        const sevColor = threat.severity === "critical" ? "#FF453A" : threat.severity === "high" ? S.orange : threat.severity === "medium" ? S.teal : S.muted;
+                        return (
+                          <div key={i} style={{ padding: "14px 20px", borderBottom: i < virusResult.threats.length - 1 ? `1px solid ${S.border}` : "none", display: "flex", alignItems: "center", gap: 14 }}>
+                            <div style={{ width: 8, height: 8, borderRadius: "50%", background: sevColor, flexShrink: 0 }} />
+                            <div style={{ flex: 1, minWidth: 0 }}>
+                              <div style={{ fontSize: 14, fontWeight: 600, color: S.text }}>{threat.name}</div>
+                              <div style={{ fontSize: 12, color: S.muted, marginTop: 2 }}>{threat.description}</div>
+                              <div style={{ fontSize: 11, color: S.muted, marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{threat.path}</div>
+                            </div>
+                            <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 6, flexShrink: 0 }}>
+                              <div style={{ fontSize: 11, fontWeight: 700, padding: "2px 8px", borderRadius: 12, background: sevColor + "22", color: sevColor, textTransform: "uppercase" }}>
+                                {threat.severity}
+                              </div>
+                              <button
+                                onClick={() => handleQuarantine(threat)}
+                                disabled={quarantining === threat.path}
+                                style={{
+                                  padding: "5px 12px", borderRadius: 7, border: "none",
+                                  background: "#FF453A22", color: "#FF453A", fontSize: 12, fontWeight: 600,
+                                  cursor: quarantining === threat.path ? "not-allowed" : "pointer",
+                                  opacity: quarantining === threat.path ? 0.5 : 1,
+                                }}
+                              >
+                                {quarantining === threat.path ? "Moving…" : "Quarantine"}
+                              </button>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+
+                  {virusResult.status === "clean" && (
+                    <div style={{ fontSize: 12, color: S.muted, textAlign: "center", padding: "4px 0 8px" }}>
+                      For a deeper scan, consider running a full system scan with a dedicated antivirus tool.
+                    </div>
+                  )}
+                </div>
+              )}
+            </>
+          )}
+
           {/* ── Cleaner tabs ── */}
-          {!isUninstallerTab && !isRepairTab && (
+          {!isUninstallerTab && !isRepairTab && tab !== "virus" && (
             <>
               {!scanning && !scanDone && (
                 <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "100%", gap: 24 }}>

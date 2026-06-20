@@ -511,6 +511,214 @@ export function verifyDiskVolume(): string {
   return "Disk verification is not supported on this platform.";
 }
 
+// ── Virus / Malware Scanner ───────────────────────────────────────────────────
+
+export interface ThreatItem {
+  path: string;
+  name: string;
+  severity: "critical" | "high" | "medium" | "low";
+  description: string;
+}
+
+export interface VirusScanResult {
+  status: "clean" | "threats_found" | "error";
+  threats: ThreatItem[];
+  scannedCount: number;
+  scanDuration: number;
+  error?: string;
+}
+
+const MAC_THREAT_PATTERNS: { pattern: RegExp; name: string; severity: ThreatItem["severity"]; desc: string }[] = [
+  { pattern: /genieo/i,        name: "Genieo",           severity: "high",     desc: "Browser hijacker that redirects searches" },
+  { pattern: /vsearch/i,       name: "VSearch",          severity: "high",     desc: "Search hijacker" },
+  { pattern: /pirrit/i,        name: "Pirrit",           severity: "high",     desc: "Adware injecting ads into browsers" },
+  { pattern: /shlayer/i,       name: "Shlayer",          severity: "critical", desc: "Malware dropper — installs other malware" },
+  { pattern: /silver.sparrow/i,name: "Silver Sparrow",   severity: "critical", desc: "Malware targeting Apple Silicon" },
+  { pattern: /adload/i,        name: "Adload",           severity: "high",     desc: "Adware loader" },
+  { pattern: /bundlore/i,      name: "Bundlore",         severity: "high",     desc: "Adware bundler" },
+  { pattern: /crossrider/i,    name: "CrossRider",       severity: "medium",   desc: "Browser extension adware" },
+  { pattern: /dnsping/i,       name: "DNSPing",          severity: "high",     desc: "DNS hijacker" },
+  { pattern: /installcore/i,   name: "InstallCore",      severity: "medium",   desc: "Bundled adware installer" },
+  { pattern: /searchmine/i,    name: "SearchMine",       severity: "high",     desc: "Browser hijacker" },
+  { pattern: /weknow/i,        name: "Weknow",           severity: "high",     desc: "Browser hijacker" },
+  { pattern: /tapufind/i,      name: "TapuFind",         severity: "high",     desc: "Browser hijacker" },
+  { pattern: /spigot/i,        name: "Spigot",           severity: "medium",   desc: "Browser redirect adware" },
+  { pattern: /babylon/i,       name: "Babylon",          severity: "high",     desc: "Browser hijacker" },
+  { pattern: /conduit/i,       name: "Conduit",          severity: "high",     desc: "Browser hijacker" },
+  { pattern: /macmediaplayer/i,name: "MacMediaPlayer",   severity: "medium",   desc: "Potentially unwanted program" },
+  { pattern: /mplayerx/i,      name: "MPlayerX",         severity: "medium",   desc: "Potentially unwanted program" },
+  { pattern: /OperatorMac/i,   name: "OperatorMac",      severity: "high",     desc: "Adware" },
+  { pattern: /zango/i,         name: "Zango",            severity: "high",     desc: "Adware" },
+];
+
+const WIN_THREAT_PATTERNS: { pattern: RegExp; name: string; severity: ThreatItem["severity"]; desc: string }[] = [
+  { pattern: /conduit/i,       name: "Conduit",          severity: "high",     desc: "Browser hijacker" },
+  { pattern: /babylon/i,       name: "Babylon",          severity: "high",     desc: "Browser hijacker" },
+  { pattern: /sweetpacks/i,    name: "SweetPacks",       severity: "high",     desc: "Adware" },
+  { pattern: /iminent/i,       name: "Iminent",          severity: "high",     desc: "Adware" },
+  { pattern: /spigot/i,        name: "Spigot",           severity: "medium",   desc: "Browser redirect" },
+  { pattern: /ask\.toolbar/i,  name: "Ask Toolbar",      severity: "medium",   desc: "Unwanted browser toolbar" },
+  { pattern: /mywebsearch/i,   name: "MyWebSearch",      severity: "high",     desc: "Browser hijacker" },
+  { pattern: /facemoods/i,     name: "Facemoods",        severity: "medium",   desc: "Adware" },
+  { pattern: /dealply/i,       name: "DealPly",          severity: "medium",   desc: "Adware" },
+  { pattern: /wajam/i,         name: "Wajam",            severity: "high",     desc: "Adware / privacy threat" },
+  { pattern: /crossrider/i,    name: "CrossRider",       severity: "medium",   desc: "Browser extension adware" },
+  { pattern: /installcore/i,   name: "InstallCore",      severity: "medium",   desc: "Bundled adware installer" },
+];
+
+function scanDirForThreats(
+  dir: string,
+  patterns: { pattern: RegExp; name: string; severity: ThreatItem["severity"]; desc: string }[],
+  depth = 1,
+  maxFiles = 500,
+): { threats: ThreatItem[]; scanned: number } {
+  const threats: ThreatItem[] = [];
+  let scanned = 0;
+  function walk(d: string, level: number) {
+    if (level > depth || scanned >= maxFiles) return;
+    let entries: fs.Dirent[];
+    try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      if (scanned >= maxFiles) break;
+      const full = path.join(d, e.name);
+      scanned++;
+      for (const t of patterns) {
+        if (t.pattern.test(e.name) || t.pattern.test(full)) {
+          threats.push({ path: full, name: t.name, severity: t.severity, description: t.desc });
+          break;
+        }
+      }
+      if (e.isDirectory() && level < depth) walk(full, level + 1);
+    }
+  }
+  walk(dir, 0);
+  return { threats, scanned };
+}
+
+export function virusScan(): VirusScanResult {
+  const start = Date.now();
+  const { execSync } = require("child_process") as typeof import("child_process");
+
+  try {
+    if (process.platform === "darwin") {
+      // ── Mac: pattern scan across persistence + app dirs ──────
+      const home = os.homedir();
+      const scanDirs = [
+        { dir: path.join(home, "Library", "LaunchAgents"), depth: 1 },
+        { dir: "/Library/LaunchAgents",                   depth: 1 },
+        { dir: "/Library/LaunchDaemons",                  depth: 1 },
+        { dir: "/Applications",                           depth: 1 },
+        { dir: path.join(home, "Library", "Application Support"), depth: 1 },
+      ];
+
+      const allThreats: ThreatItem[] = [];
+      let totalScanned = 0;
+
+      for (const { dir, depth } of scanDirs) {
+        if (!fs.existsSync(dir)) continue;
+        const { threats, scanned } = scanDirForThreats(dir, MAC_THREAT_PATTERNS, depth, 500);
+        allThreats.push(...threats);
+        totalScanned += scanned;
+      }
+
+      // Also check via mdfind for known malware app bundles
+      const knownBundles = [
+        "com.genieo", "com.vsearch", "com.pirrit", "com.babylon", "com.conduit",
+        "com.searchmine", "com.weknow", "com.adload",
+      ];
+      for (const bundleId of knownBundles) {
+        try {
+          const found = execSync(`mdfind "kMDItemCFBundleIdentifier == '*${bundleId}*'"`, { encoding: "utf-8", timeout: 5000 }) as string;
+          for (const line of found.split("\n").filter(Boolean)) {
+            if (!allThreats.some(t => t.path === line)) {
+              const match = MAC_THREAT_PATTERNS.find(p => p.pattern.test(bundleId));
+              if (match) allThreats.push({ path: line, name: match.name, severity: match.severity, description: match.desc });
+            }
+          }
+        } catch { /* skip */ }
+      }
+
+      return {
+        status: allThreats.length > 0 ? "threats_found" : "clean",
+        threats: allThreats,
+        scannedCount: totalScanned,
+        scanDuration: Date.now() - start,
+      };
+
+    } else if (process.platform === "win32") {
+      // ── Windows: Windows Defender + pattern scan ──────────────
+      const allThreats: ThreatItem[] = [];
+      let totalScanned = 0;
+
+      // 1. Run Windows Defender quick scan
+      try {
+        const defenderPath = "C:\\Program Files\\Windows Defender\\MpCmdRun.exe";
+        if (fs.existsSync(defenderPath)) {
+          execSync(`"${defenderPath}" -Scan -ScanType 1`, { timeout: 120000, stdio: "ignore" });
+        }
+      } catch { /* scan may exit non-zero if threats found — that's ok */ }
+
+      // 2. Get Windows Defender detections via PowerShell
+      try {
+        const out = execSync(
+          `powershell -NoProfile -Command "Get-MpThreatDetection | Select-Object -Property ThreatName,Resources,SeverityID | ConvertTo-Json -Depth 3"`,
+          { encoding: "utf-8", timeout: 15000 }
+        ) as string;
+        if (out && out.trim()) {
+          const parsed = JSON.parse(out.startsWith("[") ? out : `[${out}]`) as Array<{
+            ThreatName?: string; Resources?: string | string[]; SeverityID?: number;
+          }>;
+          for (const t of parsed) {
+            const resources = Array.isArray(t.Resources) ? t.Resources : [t.Resources ?? ""];
+            for (const res of resources) {
+              const sev: ThreatItem["severity"] = (t.SeverityID ?? 0) >= 5 ? "critical" : (t.SeverityID ?? 0) >= 4 ? "high" : (t.SeverityID ?? 0) >= 2 ? "medium" : "low";
+              allThreats.push({
+                path: res,
+                name: t.ThreatName ?? "Unknown threat",
+                severity: sev,
+                description: "Detected by Windows Defender",
+              });
+            }
+          }
+        }
+      } catch { /* no detections or PS unavailable */ }
+
+      // 3. Pattern scan startup + common dirs
+      const home = os.homedir();
+      const winDirs = [
+        { dir: path.join(home, "AppData", "Roaming", "Microsoft", "Windows", "Start Menu", "Programs", "Startup"), depth: 1 },
+        { dir: path.join(home, "AppData", "Roaming"), depth: 2 },
+        { dir: path.join(home, "AppData", "Local"),   depth: 2 },
+        { dir: "C:\\ProgramData",                     depth: 2 },
+      ];
+      for (const { dir, depth } of winDirs) {
+        if (!fs.existsSync(dir)) continue;
+        const { threats, scanned } = scanDirForThreats(dir, WIN_THREAT_PATTERNS, depth, 300);
+        allThreats.push(...threats);
+        totalScanned += scanned;
+      }
+
+      return {
+        status: allThreats.length > 0 ? "threats_found" : "clean",
+        threats: allThreats,
+        scannedCount: totalScanned,
+        scanDuration: Date.now() - start,
+      };
+    }
+
+    return { status: "clean", threats: [], scannedCount: 0, scanDuration: Date.now() - start };
+
+  } catch (e: unknown) {
+    return {
+      status: "error",
+      threats: [],
+      scannedCount: 0,
+      scanDuration: Date.now() - start,
+      error: String(e),
+    };
+  }
+}
+
 export function cleanPaths(
   ids: string[],
   scanResults: ScanResult[]
