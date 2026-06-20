@@ -76,14 +76,14 @@ declare global {
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const S = {
-  bg: "#0D0D10",
-  bgGrad: "linear-gradient(145deg, #13101A 0%, #0D0D10 60%, #0A1020 100%)",
-  sidebar: "rgba(20,18,28,0.95)",
-  card: "rgba(36,34,44,0.9)",
-  card2: "rgba(44,42,52,0.9)",
-  border: "rgba(255,255,255,0.07)",
+  bg: "#0B1610",
+  bgGrad: "linear-gradient(145deg, #0F1F14 0%, #0B1610 55%, #091A0E 100%)",
+  sidebar: "rgba(13,26,17,0.97)",
+  card: "rgba(22,42,28,0.92)",
+  card2: "rgba(28,50,34,0.92)",
+  border: "rgba(80,220,120,0.10)",
   text: "#FFFFFF",
-  muted: "#8E8E93",
+  muted: "#7FA98A",
   green: "#30D158",
   orange: "#FF9F0A",
   blue: "#0A84FF",
