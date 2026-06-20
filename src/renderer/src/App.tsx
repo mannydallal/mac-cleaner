@@ -1189,9 +1189,14 @@ export default function App() {
                         {virusResult.status === "clean" ? "No threats found" : virusResult.status === "threats_found" ? `${virusResult.threats.length} threat${virusResult.threats.length !== 1 ? "s" : ""} detected` : "Scan error"}
                       </div>
                       <div style={{ fontSize: 13, color: S.muted, marginTop: 3 }}>
-                        Scanned {virusResult.scannedCount.toLocaleString()} items in {(virusResult.scanDuration / 1000).toFixed(1)}s
+                        Behavioral scan — checked {virusResult.scannedCount.toLocaleString()} locations in {(virusResult.scanDuration / 1000).toFixed(1)}s
                         {virusResult.error ? ` — ${virusResult.error}` : ""}
                       </div>
+                      {virusResult.status === "clean" && (
+                        <div style={{ fontSize: 12, color: S.muted, marginTop: 4, fontStyle: "italic" }}>
+                          Checks LaunchAgents, login items, startup scripts, and known threat locations. For full signature-based scanning, pair with an antivirus like Malwarebytes.
+                        </div>
+                      )}
                     </div>
                     <button
                       onClick={handleVirusScan}
