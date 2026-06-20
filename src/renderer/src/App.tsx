@@ -30,6 +30,15 @@ type AppInfo = {
   associatedSizeMb: number;
 };
 
+type DiskHealth = {
+  smartStatus: string;
+  volumeName: string;
+  fileSystem: string;
+  totalGb: number;
+  freeGb: number;
+  brokenSymlinks: string[];
+};
+
 declare global {
   interface Window {
     cleaner: {
@@ -40,6 +49,9 @@ declare global {
       openPath: (path: string) => Promise<void>;
       scanApps: () => Promise<AppInfo[]>;
       uninstallApp: (appPath: string, associatedPaths: string[]) => Promise<{ freedMb: number; errors: string[] }>;
+      diskHealth: () => Promise<DiskHealth>;
+      verifyDisk: () => Promise<string>;
+      fixSymlinks: (paths: string[]) => Promise<{ fixed: number; errors: string[] }>;
     };
   }
 }
@@ -63,7 +75,7 @@ const S = {
   teal: "#5AC8FA",
 };
 
-type Tab = "smart" | "junk" | "privacy" | "parallels" | "uninstaller";
+type Tab = "smart" | "junk" | "privacy" | "parallels" | "uninstaller" | "repair";
 
 const NAV: { id: Tab; label: string; emoji: string; color: string }[] = [
   { id: "smart",       label: "Smart Scan",   emoji: "🔍", color: S.green  },
@@ -71,6 +83,7 @@ const NAV: { id: Tab; label: string; emoji: string; color: string }[] = [
   { id: "privacy",     label: "Privacy",      emoji: "🔒", color: S.blue   },
   { id: "parallels",   label: "Parallels",    emoji: "💻", color: S.purple },
   { id: "uninstaller", label: "Uninstaller",  emoji: "🗂", color: S.red    },
+  { id: "repair",      label: "Disk Health",  emoji: "🔧", color: S.teal   },
 ];
 
 function fmtMb(mb: number): string {
@@ -314,6 +327,13 @@ export default function App() {
   const [uninstallingApp, setUninstallingApp] = useState<string | null>(null);
   const [confirmApp, setConfirmApp] = useState<AppInfo | null>(null);
 
+  // Disk health state
+  const [diskHealth, setDiskHealth] = useState<DiskHealth | null>(null);
+  const [loadingHealth, setLoadingHealth] = useState(false);
+  const [verifyOutput, setVerifyOutput] = useState<string | null>(null);
+  const [verifying, setVerifying] = useState(false);
+  const [fixingSymlinks, setFixingSymlinks] = useState(false);
+
   const platform = window.cleaner?.platform ?? "darwin";
   const isMac = platform === "darwin";
 
@@ -361,6 +381,48 @@ export default function App() {
       setCleaning(false);
     }
   }, [selected]);
+
+  const handleDiskHealth = useCallback(async () => {
+    if (!window.cleaner) return;
+    setLoadingHealth(true);
+    setVerifyOutput(null);
+    try {
+      const result = await window.cleaner.diskHealth();
+      setDiskHealth(result);
+    } finally {
+      setLoadingHealth(false);
+    }
+  }, []);
+
+  const handleVerifyDisk = useCallback(async () => {
+    if (!window.cleaner) return;
+    setVerifying(true);
+    setVerifyOutput(null);
+    try {
+      const out = await window.cleaner.verifyDisk();
+      setVerifyOutput(out);
+    } finally {
+      setVerifying(false);
+    }
+  }, []);
+
+  const handleFixSymlinks = useCallback(async (paths: string[]) => {
+    if (!window.cleaner) return;
+    setFixingSymlinks(true);
+    try {
+      const result = await window.cleaner.fixSymlinks(paths);
+      if (result.errors.length > 0) {
+        showToast(`⚠ Fixed ${result.fixed}, failed on ${result.errors.length}`);
+      } else {
+        showToast(`Fixed ${result.fixed} broken symlink${result.fixed !== 1 ? "s" : ""}`);
+      }
+      // Re-scan to refresh list
+      const fresh = await window.cleaner.diskHealth();
+      setDiskHealth(fresh);
+    } finally {
+      setFixingSymlinks(false);
+    }
+  }, []);
 
   const handleScanApps = useCallback(async () => {
     if (!window.cleaner) return;
@@ -420,6 +482,7 @@ export default function App() {
   const ramPct = stats ? Math.round((stats.ramUsedGb / stats.ramTotalGb) * 100) : 0;
 
   const isUninstallerTab = tab === "uninstaller";
+  const isRepairTab = tab === "repair";
 
   return (
     <div style={{ display: "flex", height: "100vh", background: S.bgGrad, overflow: "hidden", position: "relative" }}>
@@ -530,7 +593,19 @@ export default function App() {
             )}
           </div>
           <div style={{ display: "flex", gap: 10 }}>
-            {isUninstallerTab ? (
+            {isRepairTab ? (
+              <button
+                onClick={handleDiskHealth}
+                disabled={loadingHealth}
+                style={{
+                  padding: "9px 20px", borderRadius: 10, border: "none",
+                  background: "rgba(255,255,255,0.1)", color: S.text, fontSize: 14, fontWeight: 600,
+                  cursor: loadingHealth ? "not-allowed" : "pointer", opacity: loadingHealth ? 0.6 : 1,
+                }}
+              >
+                {loadingHealth ? "Scanning…" : "Scan Disk"}
+              </button>
+            ) : isUninstallerTab ? (
               <button
                 onClick={handleScanApps}
                 disabled={loadingApps}
@@ -611,8 +686,141 @@ export default function App() {
             </>
           )}
 
+          {/* ── Repair / Disk Health tab ── */}
+          {isRepairTab && (
+            <>
+              {!loadingHealth && !diskHealth && (
+                <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "100%", gap: 16 }}>
+                  <div style={{ fontSize: 48 }}>🔧</div>
+                  <div style={{ fontSize: 15, color: S.muted, textAlign: "center" }}>
+                    Click <strong style={{ color: S.text }}>Scan Disk</strong> to check your drive health and find broken files
+                  </div>
+                </div>
+              )}
+              {loadingHealth && (
+                <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "100%", gap: 16 }}>
+                  <div style={{ width: 60, height: 60, borderRadius: "50%", border: `4px solid rgba(255,255,255,0.08)`, borderTop: `4px solid ${S.teal}`, animation: "spin 0.8s linear infinite" }} />
+                  <div style={{ color: S.muted, fontSize: 15 }}>Checking disk health…</div>
+                  <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
+                </div>
+              )}
+              {diskHealth && !loadingHealth && (
+                <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+
+                  {/* SMART status card */}
+                  <div style={{ background: S.card, borderRadius: 14, padding: "20px 24px", display: "flex", alignItems: "center", gap: 20 }}>
+                    <div style={{
+                      width: 52, height: 52, borderRadius: 14, flexShrink: 0,
+                      background: diskHealth.smartStatus === "Verified" ? S.green + "22" : S.red + "22",
+                      display: "flex", alignItems: "center", justifyContent: "center", fontSize: 26,
+                    }}>
+                      {diskHealth.smartStatus === "Verified" ? "✅" : diskHealth.smartStatus === "Unknown" ? "❓" : "⚠️"}
+                    </div>
+                    <div style={{ flex: 1 }}>
+                      <div style={{ fontSize: 16, fontWeight: 700, color: S.text }}>{diskHealth.volumeName}</div>
+                      <div style={{ fontSize: 13, color: S.muted, marginTop: 2 }}>
+                        {diskHealth.fileSystem} · {diskHealth.totalGb.toFixed(0)} GB total · {diskHealth.freeGb.toFixed(1)} GB free
+                      </div>
+                    </div>
+                    <div style={{ textAlign: "right", flexShrink: 0 }}>
+                      <div style={{
+                        fontSize: 13, fontWeight: 700, padding: "4px 12px", borderRadius: 20,
+                        background: diskHealth.smartStatus === "Verified" ? S.green + "22" : S.red + "22",
+                        color: diskHealth.smartStatus === "Verified" ? S.green : diskHealth.smartStatus === "Unknown" ? S.muted : S.red,
+                        border: `1px solid ${diskHealth.smartStatus === "Verified" ? S.green + "44" : S.red + "44"}`,
+                      }}>
+                        S.M.A.R.T.: {diskHealth.smartStatus}
+                      </div>
+                      {diskHealth.smartStatus === "Verified" && (
+                        <div style={{ fontSize: 11, color: S.muted, marginTop: 6 }}>Drive is healthy</div>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* Broken symlinks card */}
+                  <div style={{ background: S.card, borderRadius: 14, overflow: "hidden" }}>
+                    <div style={{ padding: "16px 20px", display: "flex", alignItems: "center", justifyContent: "space-between", borderBottom: diskHealth.brokenSymlinks.length > 0 ? `1px solid ${S.border}` : "none" }}>
+                      <div>
+                        <div style={{ fontSize: 15, fontWeight: 700, color: S.text }}>🔗 Broken Symlinks</div>
+                        <div style={{ fontSize: 13, color: S.muted, marginTop: 2 }}>
+                          {diskHealth.brokenSymlinks.length === 0
+                            ? "No broken symlinks found"
+                            : `${diskHealth.brokenSymlinks.length} broken link${diskHealth.brokenSymlinks.length > 1 ? "s" : ""} found`}
+                        </div>
+                      </div>
+                      {diskHealth.brokenSymlinks.length > 0 && (
+                        <button
+                          onClick={() => handleFixSymlinks(diskHealth.brokenSymlinks)}
+                          disabled={fixingSymlinks}
+                          style={{
+                            padding: "7px 16px", borderRadius: 8, border: "none",
+                            background: S.teal + "22", color: S.teal, fontSize: 13, fontWeight: 600,
+                            cursor: fixingSymlinks ? "not-allowed" : "pointer", opacity: fixingSymlinks ? 0.6 : 1,
+                          }}
+                        >
+                          {fixingSymlinks ? "Fixing…" : "Fix All"}
+                        </button>
+                      )}
+                    </div>
+                    {diskHealth.brokenSymlinks.slice(0, 12).map((p, i) => (
+                      <div key={i} style={{ padding: "9px 20px", borderBottom: i < Math.min(diskHealth.brokenSymlinks.length, 12) - 1 ? `1px solid ${S.border}` : "none", fontSize: 12, color: S.muted, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                        {p}
+                      </div>
+                    ))}
+                    {diskHealth.brokenSymlinks.length > 12 && (
+                      <div style={{ padding: "9px 20px", fontSize: 12, color: S.muted }}>
+                        …and {diskHealth.brokenSymlinks.length - 12} more
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Volume verify card */}
+                  <div style={{ background: S.card, borderRadius: 14, overflow: "hidden" }}>
+                    <div style={{ padding: "16px 20px", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                      <div>
+                        <div style={{ fontSize: 15, fontWeight: 700, color: S.text }}>🗂 Volume Verification</div>
+                        <div style={{ fontSize: 13, color: S.muted, marginTop: 2 }}>
+                          {verifyOutput ? "Scan complete" : "Deep scan for filesystem errors (takes 1–2 min)"}
+                        </div>
+                      </div>
+                      <button
+                        onClick={handleVerifyDisk}
+                        disabled={verifying}
+                        style={{
+                          padding: "7px 16px", borderRadius: 8, border: "none",
+                          background: "rgba(255,255,255,0.08)", color: S.text, fontSize: 13, fontWeight: 600,
+                          cursor: verifying ? "not-allowed" : "pointer", opacity: verifying ? 0.6 : 1,
+                        }}
+                      >
+                        {verifying ? "Verifying…" : verifyOutput ? "Re-run" : "Run Verify"}
+                      </button>
+                    </div>
+                    {verifying && (
+                      <div style={{ padding: "12px 20px", borderTop: `1px solid ${S.border}`, color: S.muted, fontSize: 13 }}>
+                        Running diskutil verifyVolume / — this may take a minute…
+                      </div>
+                    )}
+                    {verifyOutput && (
+                      <div style={{ padding: "14px 20px", borderTop: `1px solid ${S.border}` }}>
+                        <pre style={{ fontSize: 11, color: verifyOutput.toLowerCase().includes("error") || verifyOutput.toLowerCase().includes("fail") ? S.orange : S.green, margin: 0, whiteSpace: "pre-wrap", wordBreak: "break-word", maxHeight: 200, overflow: "auto" }}>
+                          {verifyOutput.trim()}
+                        </pre>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Note */}
+                  <div style={{ fontSize: 12, color: S.muted, textAlign: "center", padding: "4px 0 8px" }}>
+                    For deeper repairs, use Disk Utility → First Aid, or boot into Recovery Mode (⌘+R on startup)
+                  </div>
+
+                </div>
+              )}
+            </>
+          )}
+
           {/* ── Cleaner tabs ── */}
-          {!isUninstallerTab && (
+          {!isUninstallerTab && !isRepairTab && (
             <>
               {!scanning && !scanDone && (
                 <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "100%", gap: 24 }}>

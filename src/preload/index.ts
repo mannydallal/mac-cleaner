@@ -33,6 +33,15 @@ export type AppInfo = {
   associatedSizeMb: number;
 };
 
+export type DiskHealth = {
+  smartStatus: string;
+  volumeName: string;
+  fileSystem: string;
+  totalGb: number;
+  freeGb: number;
+  brokenSymlinks: string[];
+};
+
 contextBridge.exposeInMainWorld("cleaner", {
   platform: process.platform,
   scan: (): Promise<ScanResult[]> => ipcRenderer.invoke("scan"),
@@ -42,4 +51,8 @@ contextBridge.exposeInMainWorld("cleaner", {
   scanApps: (): Promise<AppInfo[]> => ipcRenderer.invoke("scan-apps"),
   uninstallApp: (appPath: string, associatedPaths: string[]): Promise<CleanResult> =>
     ipcRenderer.invoke("uninstall-app", appPath, associatedPaths),
+  diskHealth: (): Promise<DiskHealth> => ipcRenderer.invoke("disk-health"),
+  verifyDisk: (): Promise<string> => ipcRenderer.invoke("verify-disk"),
+  fixSymlinks: (paths: string[]): Promise<{ fixed: number; errors: string[] }> =>
+    ipcRenderer.invoke("fix-symlinks", paths),
 });

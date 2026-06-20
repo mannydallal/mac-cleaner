@@ -2,7 +2,7 @@ import { app, BrowserWindow, ipcMain, shell } from "electron";
 import * as path from "path";
 import * as os from "os";
 import * as fs from "fs";
-import { scanSystem, cleanPaths, scanApps, getSizeOf, ScanResult, AppInfo } from "./scanner";
+import { scanSystem, cleanPaths, scanApps, getSizeOf, getDiskHealth, verifyDiskVolume, ScanResult, AppInfo } from "./scanner";
 
 let scanCache: ScanResult[] = [];
 let appCache: AppInfo[] = [];
@@ -118,6 +118,30 @@ ipcMain.handle("open-path", async (_event, p: string) => {
 ipcMain.handle("scan-apps", async () => {
   appCache = scanApps();
   return appCache;
+});
+
+ipcMain.handle("disk-health", async () => {
+  return getDiskHealth();
+});
+
+ipcMain.handle("verify-disk", async () => {
+  return verifyDiskVolume();
+});
+
+ipcMain.handle("fix-symlinks", async (_event, paths: string[]) => {
+  const errors: string[] = [];
+  let fixed = 0;
+  for (const p of paths) {
+    try {
+      if (fs.existsSync(p) || fs.lstatSync(p).isSymbolicLink()) {
+        fs.unlinkSync(p);
+        fixed++;
+      }
+    } catch (e) {
+      errors.push(`${path.basename(p)}: ${String(e)}`);
+    }
+  }
+  return { fixed, errors };
 });
 
 ipcMain.handle("uninstall-app", async (_event, appPath: string, associatedPaths: string[]) => {

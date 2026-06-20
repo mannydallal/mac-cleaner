@@ -373,6 +373,96 @@ export function getSizeOf(p: string): number {
   try { return getFolderSize(p).sizeMb; } catch { return 0; }
 }
 
+// ── Disk health ───────────────────────────────────────────────────────────────
+
+export type DiskHealth = {
+  smartStatus: string;
+  volumeName: string;
+  fileSystem: string;
+  totalGb: number;
+  freeGb: number;
+  brokenSymlinks: string[];
+};
+
+function findBrokenSymlinks(dir: string, maxDepth = 3, maxFound = 100): string[] {
+  const found: string[] = [];
+  const scan = (d: string, depth: number) => {
+    if (depth > maxDepth || found.length >= maxFound) return;
+    try {
+      const entries = fs.readdirSync(d, { withFileTypes: true });
+      for (const e of entries) {
+        if (found.length >= maxFound) break;
+        const full = path.join(d, e.name);
+        try {
+          if (e.isSymbolicLink()) {
+            const target = fs.readlinkSync(full);
+            const resolved = path.resolve(d, target);
+            if (!fs.existsSync(resolved)) found.push(full);
+          } else if (e.isDirectory() && !e.isSymbolicLink() && depth < maxDepth) {
+            scan(full, depth + 1);
+          }
+        } catch { /* skip inaccessible */ }
+      }
+    } catch { /* skip */ }
+  };
+  scan(dir, 0);
+  return found;
+}
+
+export function getDiskHealth(): DiskHealth {
+  let smartStatus = "Unknown";
+  let volumeName = "Macintosh HD";
+  let fileSystem = "APFS";
+  let totalGb = 0;
+  let freeGb = 0;
+
+  if (process.platform === "darwin") {
+    try {
+      const { execSync } = require("child_process") as typeof import("child_process");
+      const out = execSync("diskutil info /", { encoding: "utf-8", timeout: 8000 }) as string;
+      const smart = out.match(/S\.M\.A\.R\.T\. Status:\s*(.+)/);
+      const vol = out.match(/Volume Name:\s*(.+)/);
+      const fsLine = out.match(/Type \(Bundle\):\s*(.+)/);
+      if (smart) smartStatus = smart[1].trim();
+      if (vol) volumeName = vol[1].trim();
+      if (fsLine) fileSystem = fsLine[1].trim();
+    } catch { /* skip */ }
+
+    try {
+      const { execSync } = require("child_process") as typeof import("child_process");
+      const df = (execSync("df -k /", { encoding: "utf-8" }) as string).split("\n")[1].trim().split(/\s+/);
+      totalGb = (parseInt(df[1]) * 1024) / 1e9;
+      freeGb = (parseInt(df[3]) * 1024) / 1e9;
+    } catch { /* skip */ }
+  }
+
+  const home = os.homedir();
+  const symlinkDirs = [
+    path.join(home, "Library", "Application Support"),
+    "/usr/local/bin",
+    "/usr/local/lib",
+    "/opt/homebrew/bin",
+  ];
+  const brokenSymlinks: string[] = [];
+  for (const d of symlinkDirs) {
+    if (fs.existsSync(d)) brokenSymlinks.push(...findBrokenSymlinks(d, 2, 100 - brokenSymlinks.length));
+    if (brokenSymlinks.length >= 100) break;
+  }
+
+  return { smartStatus, volumeName, fileSystem, totalGb, freeGb, brokenSymlinks };
+}
+
+export function verifyDiskVolume(): string {
+  if (process.platform !== "darwin") return "Volume verification is only supported on macOS.";
+  try {
+    const { execSync } = require("child_process") as typeof import("child_process");
+    return execSync("diskutil verifyVolume /", { encoding: "utf-8", timeout: 120000 }) as string;
+  } catch (e: unknown) {
+    const err = e as { stdout?: string; message?: string };
+    return err.stdout ?? err.message ?? String(e);
+  }
+}
+
 export function cleanPaths(
   ids: string[],
   scanResults: ScanResult[]
