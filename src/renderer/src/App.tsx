@@ -76,20 +76,20 @@ declare global {
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const S = {
-  bg: "#0B1610",
-  bgGrad: "linear-gradient(145deg, #0F1F14 0%, #0B1610 55%, #091A0E 100%)",
-  sidebar: "rgba(13,26,17,0.97)",
-  card: "rgba(22,42,28,0.92)",
-  card2: "rgba(28,50,34,0.92)",
-  border: "rgba(80,220,120,0.10)",
-  text: "#FFFFFF",
-  muted: "#7FA98A",
-  green: "#30D158",
-  orange: "#FF9F0A",
-  blue: "#0A84FF",
-  red: "#FF453A",
-  purple: "#BF5AF2",
-  teal: "#5AC8FA",
+  bg: "#EAF6EC",
+  bgGrad: "linear-gradient(145deg, #D8F0DC 0%, #EAF6EC 55%, #E0F5E4 100%)",
+  sidebar: "rgba(210,238,215,0.98)",
+  card: "rgba(255,255,255,0.88)",
+  card2: "rgba(240,252,242,0.92)",
+  border: "rgba(40,160,70,0.15)",
+  text: "#142018",
+  muted: "#4A7055",
+  green: "#1A8C38",
+  orange: "#C06800",
+  blue: "#0060CC",
+  red: "#C42020",
+  purple: "#7030B0",
+  teal: "#0078A0",
 };
 
 type Tab = "smart" | "junk" | "privacy" | "parallels" | "uninstaller" | "repair" | "virus";

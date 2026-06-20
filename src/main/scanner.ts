@@ -601,34 +601,62 @@ export function virusScan(): VirusScanResult {
 
   try {
     if (process.platform === "darwin") {
-      // ── Mac: pattern scan across persistence + app dirs ──────
+      // ── Mac: deep multi-pass scan ─────────────────────────────
       const home = os.homedir();
-      const scanDirs = [
-        { dir: path.join(home, "Library", "LaunchAgents"), depth: 1 },
-        { dir: "/Library/LaunchAgents",                   depth: 1 },
-        { dir: "/Library/LaunchDaemons",                  depth: 1 },
-        { dir: "/Applications",                           depth: 1 },
-        { dir: path.join(home, "Library", "Application Support"), depth: 1 },
-      ];
-
       const allThreats: ThreatItem[] = [];
       let totalScanned = 0;
 
-      for (const { dir, depth } of scanDirs) {
+      // Pass 1: persistence locations (deep)
+      const persistDirs = [
+        { dir: path.join(home, "Library", "LaunchAgents"),          depth: 3 },
+        { dir: "/Library/LaunchAgents",                              depth: 3 },
+        { dir: "/Library/LaunchDaemons",                             depth: 3 },
+        { dir: "/System/Library/LaunchDaemons",                      depth: 2 },
+        { dir: path.join(home, "Library", "StartupItems"),           depth: 2 },
+        { dir: "/Library/StartupItems",                              depth: 2 },
+      ];
+      for (const { dir, depth } of persistDirs) {
         if (!fs.existsSync(dir)) continue;
-        const { threats, scanned } = scanDirForThreats(dir, MAC_THREAT_PATTERNS, depth, 500);
+        const { threats, scanned } = scanDirForThreats(dir, MAC_THREAT_PATTERNS, depth, 2000);
         allThreats.push(...threats);
         totalScanned += scanned;
       }
 
-      // Also check via mdfind for known malware app bundles
+      // Pass 2: Applications + user dirs (broad)
+      const broadDirs = [
+        { dir: "/Applications",                                       depth: 2 },
+        { dir: path.join(home, "Applications"),                      depth: 2 },
+        { dir: path.join(home, "Library", "Application Support"),    depth: 3 },
+        { dir: path.join(home, "Library", "Internet Plug-Ins"),      depth: 2 },
+        { dir: "/Library/Internet Plug-Ins",                         depth: 2 },
+        { dir: path.join(home, "Library", "Extensions"),             depth: 2 },
+        { dir: "/Library/Extensions",                                 depth: 2 },
+        { dir: path.join(home, "Downloads"),                         depth: 2 },
+        { dir: path.join(home, "Desktop"),                           depth: 2 },
+        { dir: path.join(home, "Library", "Preferences"),            depth: 1 },
+        { dir: "/Library/Preferences",                               depth: 1 },
+        { dir: "/private/tmp",                                        depth: 2 },
+        { dir: "/tmp",                                                depth: 2 },
+      ];
+      for (const { dir, depth } of broadDirs) {
+        if (!fs.existsSync(dir)) continue;
+        const { threats, scanned } = scanDirForThreats(dir, MAC_THREAT_PATTERNS, depth, 2000);
+        allThreats.push(...threats);
+        totalScanned += scanned;
+      }
+
+      // Pass 3: mdfind bundle ID sweep (covers all mounted volumes)
       const knownBundles = [
         "com.genieo", "com.vsearch", "com.pirrit", "com.babylon", "com.conduit",
-        "com.searchmine", "com.weknow", "com.adload",
+        "com.searchmine", "com.weknow", "com.adload", "com.bundlore", "com.shlayer",
+        "com.installcore", "com.crossrider", "com.tapufind", "com.dnsping",
       ];
       for (const bundleId of knownBundles) {
         try {
-          const found = execSync(`mdfind "kMDItemCFBundleIdentifier == '*${bundleId}*'"`, { encoding: "utf-8", timeout: 5000 }) as string;
+          const found = execSync(
+            `mdfind "kMDItemCFBundleIdentifier == '*${bundleId}*'"`,
+            { encoding: "utf-8", timeout: 8000 }
+          ) as string;
           for (const line of found.split("\n").filter(Boolean)) {
             if (!allThreats.some(t => t.path === line)) {
               const match = MAC_THREAT_PATTERNS.find(p => p.pattern.test(bundleId));
@@ -638,6 +666,61 @@ export function virusScan(): VirusScanResult {
         } catch { /* skip */ }
       }
 
+      // Pass 4: find unsigned / suspicious executables in common drop paths
+      const dropPaths = [
+        path.join(home, "Downloads"),
+        path.join(home, "Desktop"),
+        "/tmp",
+        "/private/tmp",
+      ];
+      for (const dp of dropPaths) {
+        if (!fs.existsSync(dp)) continue;
+        try {
+          // find executables that lack a valid Apple code signature
+          const out = execSync(
+            `find "${dp}" -maxdepth 3 -type f \\( -name "*.pkg" -o -name "*.dmg" -o -name "*.app" -o -perm +111 \\) 2>/dev/null | head -200`,
+            { encoding: "utf-8", timeout: 15000 }
+          ) as string;
+          for (const fp of out.split("\n").filter(Boolean)) {
+            totalScanned++;
+            // check code signature
+            try {
+              execSync(`codesign --verify --strict "${fp}" 2>&1`, { timeout: 3000, stdio: "pipe" });
+            } catch {
+              // no valid signature — check if it matches any threat pattern by name
+              const base = path.basename(fp);
+              for (const t of MAC_THREAT_PATTERNS) {
+                if (t.pattern.test(base) || t.pattern.test(fp)) {
+                  if (!allThreats.some(x => x.path === fp)) {
+                    allThreats.push({ path: fp, name: t.name, severity: t.severity, description: t.desc });
+                  }
+                  break;
+                }
+              }
+            }
+          }
+        } catch { /* skip */ }
+      }
+
+      // Pass 5: check login items via osascript
+      try {
+        const items = execSync(
+          `osascript -e 'tell application "System Events" to get the path of every login item'`,
+          { encoding: "utf-8", timeout: 8000 }
+        ) as string;
+        for (const item of items.split(", ").map(s => s.trim()).filter(Boolean)) {
+          totalScanned++;
+          for (const t of MAC_THREAT_PATTERNS) {
+            if (t.pattern.test(item)) {
+              if (!allThreats.some(x => x.path === item)) {
+                allThreats.push({ path: item, name: t.name, severity: t.severity, description: `Login item: ${t.desc}` });
+              }
+              break;
+            }
+          }
+        }
+      } catch { /* skip */ }
+
       return {
         status: allThreats.length > 0 ? "threats_found" : "clean",
         threats: allThreats,
@@ -646,23 +729,23 @@ export function virusScan(): VirusScanResult {
       };
 
     } else if (process.platform === "win32") {
-      // ── Windows: Windows Defender + pattern scan ──────────────
+      // ── Windows: Windows Defender full scan + deep pattern sweep ──
       const allThreats: ThreatItem[] = [];
       let totalScanned = 0;
 
-      // 1. Run Windows Defender quick scan
+      // 1. Run Windows Defender full scan (ScanType 2)
       try {
         const defenderPath = "C:\\Program Files\\Windows Defender\\MpCmdRun.exe";
         if (fs.existsSync(defenderPath)) {
-          execSync(`"${defenderPath}" -Scan -ScanType 1`, { timeout: 120000, stdio: "ignore" });
+          execSync(`"${defenderPath}" -Scan -ScanType 2`, { timeout: 300000 });
         }
-      } catch { /* scan may exit non-zero if threats found — that's ok */ }
+      } catch { /* exits non-zero when threats found — ok */ }
 
-      // 2. Get Windows Defender detections via PowerShell
+      // 2. Pull all Defender detections via PowerShell
       try {
         const out = execSync(
           `powershell -NoProfile -Command "Get-MpThreatDetection | Select-Object -Property ThreatName,Resources,SeverityID | ConvertTo-Json -Depth 3"`,
-          { encoding: "utf-8", timeout: 15000 }
+          { encoding: "utf-8", timeout: 20000 }
         ) as string;
         if (out && out.trim()) {
           const parsed = JSON.parse(out.startsWith("[") ? out : `[${out}]`) as Array<{
@@ -672,31 +755,60 @@ export function virusScan(): VirusScanResult {
             const resources = Array.isArray(t.Resources) ? t.Resources : [t.Resources ?? ""];
             for (const res of resources) {
               const sev: ThreatItem["severity"] = (t.SeverityID ?? 0) >= 5 ? "critical" : (t.SeverityID ?? 0) >= 4 ? "high" : (t.SeverityID ?? 0) >= 2 ? "medium" : "low";
-              allThreats.push({
-                path: res,
-                name: t.ThreatName ?? "Unknown threat",
-                severity: sev,
-                description: "Detected by Windows Defender",
-              });
+              if (!allThreats.some(x => x.path === res)) {
+                allThreats.push({ path: res, name: t.ThreatName ?? "Unknown threat", severity: sev, description: "Detected by Windows Defender" });
+              }
             }
           }
         }
       } catch { /* no detections or PS unavailable */ }
 
-      // 3. Pattern scan startup + common dirs
+      // 3. Deep pattern scan across all user + system dirs
       const home = os.homedir();
       const winDirs = [
-        { dir: path.join(home, "AppData", "Roaming", "Microsoft", "Windows", "Start Menu", "Programs", "Startup"), depth: 1 },
-        { dir: path.join(home, "AppData", "Roaming"), depth: 2 },
-        { dir: path.join(home, "AppData", "Local"),   depth: 2 },
-        { dir: "C:\\ProgramData",                     depth: 2 },
+        { dir: path.join(home, "AppData", "Roaming", "Microsoft", "Windows", "Start Menu", "Programs", "Startup"), depth: 2 },
+        { dir: path.join(home, "AppData", "Roaming"),   depth: 4 },
+        { dir: path.join(home, "AppData", "Local"),     depth: 4 },
+        { dir: path.join(home, "AppData", "LocalLow"),  depth: 3 },
+        { dir: path.join(home, "Downloads"),            depth: 3 },
+        { dir: path.join(home, "Desktop"),              depth: 2 },
+        { dir: "C:\\ProgramData",                       depth: 3 },
+        { dir: "C:\\Program Files",                     depth: 3 },
+        { dir: "C:\\Program Files (x86)",               depth: 3 },
+        { dir: "C:\\Windows\\Temp",                     depth: 2 },
+        { dir: path.join(home, "AppData", "Local", "Temp"), depth: 3 },
       ];
       for (const { dir, depth } of winDirs) {
         if (!fs.existsSync(dir)) continue;
-        const { threats, scanned } = scanDirForThreats(dir, WIN_THREAT_PATTERNS, depth, 300);
-        allThreats.push(...threats);
+        const { threats, scanned } = scanDirForThreats(dir, WIN_THREAT_PATTERNS, depth, 3000);
+        for (const t of threats) {
+          if (!allThreats.some(x => x.path === t.path)) allThreats.push(t);
+        }
         totalScanned += scanned;
       }
+
+      // 4. Check run registry keys via PowerShell
+      try {
+        const regOut = execSync(
+          `powershell -NoProfile -Command "Get-ItemProperty 'HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run' | ConvertTo-Json -Depth 2"`,
+          { encoding: "utf-8", timeout: 10000 }
+        ) as string;
+        if (regOut && regOut.trim()) {
+          const regMap = JSON.parse(regOut) as Record<string, string>;
+          for (const [key, val] of Object.entries(regMap)) {
+            if (typeof val !== "string" || key.startsWith("PS")) continue;
+            totalScanned++;
+            for (const t of WIN_THREAT_PATTERNS) {
+              if (t.pattern.test(key) || t.pattern.test(val)) {
+                if (!allThreats.some(x => x.path === val)) {
+                  allThreats.push({ path: val, name: t.name, severity: t.severity, description: `Registry startup entry: ${t.desc}` });
+                }
+                break;
+              }
+            }
+          }
+        }
+      } catch { /* skip */ }
 
       return {
         status: allThreats.length > 0 ? "threats_found" : "clean",
