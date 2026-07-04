@@ -661,6 +661,52 @@ export function scanSystem(): ScanResult[] {
   return results.sort((a, b) => b.sizeMb - a.sizeMb);
 }
 
+// ── Parallels info ────────────────────────────────────────────────────────────
+
+export type ParallelsInfo = {
+  installed: boolean;
+  version: string;
+  vms: { name: string; sizeMb: number }[];
+  totalVmSizeMb: number;
+};
+
+export function getParallelsInfo(): ParallelsInfo {
+  const home = os.homedir();
+  const appPath = "/Applications/Parallels Desktop.app/Contents/Info.plist";
+  let version = "";
+
+  if (fs.existsSync(appPath)) {
+    try {
+      const plist = fs.readFileSync(appPath, "utf-8");
+      const short = plist.match(/<key>CFBundleShortVersionString<\/key>\s*<string>([^<]+)<\/string>/);
+      const bundle = plist.match(/<key>CFBundleVersion<\/key>\s*<string>([^<]+)<\/string>/);
+      if (short) version = short[1].trim();
+      else if (bundle) version = bundle[1].trim();
+    } catch { /* skip */ }
+  }
+
+  const vmsDir = path.join(home, "Parallels");
+  const vms: { name: string; sizeMb: number }[] = [];
+
+  if (fs.existsSync(vmsDir)) {
+    try {
+      const entries = fs.readdirSync(vmsDir, { withFileTypes: true });
+      for (const entry of entries) {
+        if (!entry.name.endsWith(".pvm")) continue;
+        const vmPath = path.join(vmsDir, entry.name);
+        const { sizeMb } = getFolderSize(vmPath);
+        vms.push({ name: entry.name.replace(/\.pvm$/, ""), sizeMb });
+      }
+    } catch { /* skip */ }
+  }
+
+  vms.sort((a, b) => b.sizeMb - a.sizeMb);
+  const totalVmSizeMb = vms.reduce((s, v) => s + v.sizeMb, 0);
+  const installed = !!version || vms.length > 0;
+
+  return { installed, version, vms, totalVmSizeMb };
+}
+
 // ── App scanner ───────────────────────────────────────────────────────────────
 
 export type AppInfo = {

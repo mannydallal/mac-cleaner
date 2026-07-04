@@ -59,6 +59,7 @@ declare global {
     cleaner: {
       platform: string;
       checkPermission: () => Promise<boolean>;
+      getParallelsInfo: () => Promise<{ installed: boolean; version: string; vms: { name: string; sizeMb: number }[]; totalVmSizeMb: number }>;
       scan: () => Promise<ScanResult[]>;
       clean: (ids: string[]) => Promise<{ freedMb: number; errors: string[] }>;
       getStats: () => Promise<SystemStats>;
@@ -341,6 +342,7 @@ export default function App() {
   const [toast, setToast] = useState<string | null>(null);
   const [scanDone, setScanDone] = useState(false);
   const [needsPermission, setNeedsPermission] = useState(false);
+  const [parallelsInfo, setParallelsInfo] = useState<{ installed: boolean; version: string; vms: { name: string; sizeMb: number }[]; totalVmSizeMb: number } | null>(null);
 
   // Uninstaller state
   const [appList, setAppList] = useState<AppInfo[]>([]);
@@ -382,6 +384,11 @@ export default function App() {
     }, 5000);
     return () => clearInterval(iv);
   }, []);
+
+  useEffect(() => {
+    if (tab !== "parallels" || !window.cleaner) return;
+    window.cleaner.getParallelsInfo().then(setParallelsInfo).catch(() => {});
+  }, [tab]);
 
   const handleScan = useCallback(async () => {
     if (!window.cleaner) return;
@@ -1268,6 +1275,56 @@ export default function App() {
           {/* ── Cleaner tabs ── */}
           {!isUninstallerTab && !isRepairTab && tab !== "virus" && (
             <>
+              {/* Parallels version + VM banner */}
+              {tab === "parallels" && parallelsInfo && (
+                <div style={{
+                  margin: "0 0 4px 0",
+                  padding: "14px 20px",
+                  background: parallelsInfo.installed
+                    ? `linear-gradient(135deg, ${S.purple}22 0%, ${S.purple}08 100%)`
+                    : "rgba(0,0,0,0.04)",
+                  borderBottom: `1px solid ${S.border}`,
+                  display: "flex", alignItems: "center", gap: 18, flexShrink: 0,
+                }}>
+                  <div style={{ fontSize: 36 }}>💻</div>
+                  <div style={{ flex: 1 }}>
+                    {parallelsInfo.installed ? (
+                      <>
+                        <div style={{ fontSize: 14, fontWeight: 700, color: S.text }}>
+                          Parallels Desktop {parallelsInfo.version ? parallelsInfo.version.split(".")[0] : ""} detected
+                          {parallelsInfo.version && (
+                            <span style={{ fontSize: 11, fontWeight: 400, color: S.muted, marginLeft: 8 }}>
+                              v{parallelsInfo.version}
+                            </span>
+                          )}
+                        </div>
+                        {parallelsInfo.vms.length > 0 ? (
+                          <div style={{ fontSize: 12, color: S.muted, marginTop: 4, display: "flex", gap: 12, flexWrap: "wrap" }}>
+                            {parallelsInfo.vms.map(vm => (
+                              <span key={vm.name} style={{
+                                background: S.purple + "20", borderRadius: 6, padding: "2px 8px",
+                                color: S.purple, fontWeight: 500,
+                              }}>
+                                {vm.name} · {fmtMb(vm.sizeMb)}
+                              </span>
+                            ))}
+                          </div>
+                        ) : (
+                          <div style={{ fontSize: 12, color: S.muted, marginTop: 3 }}>No VMs found in ~/Parallels</div>
+                        )}
+                      </>
+                    ) : (
+                      <div style={{ fontSize: 14, color: S.muted }}>Parallels Desktop not detected on this Mac</div>
+                    )}
+                  </div>
+                  {parallelsInfo.installed && parallelsInfo.totalVmSizeMb > 0 && (
+                    <div style={{ textAlign: "right", flexShrink: 0 }}>
+                      <div style={{ fontSize: 20, fontWeight: 800, color: S.purple }}>{fmtMb(parallelsInfo.totalVmSizeMb)}</div>
+                      <div style={{ fontSize: 11, color: S.muted }}>total VMs</div>
+                    </div>
+                  )}
+                </div>
+              )}
               {!scanning && !scanDone && (
                 <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "100%", gap: 24 }}>
                   {/* Hero graphic */}

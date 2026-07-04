@@ -60,6 +60,8 @@ export type VirusScanResult = {
 contextBridge.exposeInMainWorld("cleaner", {
   platform: process.platform,
   checkPermission: (): Promise<boolean> => ipcRenderer.invoke("check-permission"),
+  getParallelsInfo: (): Promise<{ installed: boolean; version: string; vms: { name: string; sizeMb: number }[]; totalVmSizeMb: number }> =>
+    ipcRenderer.invoke("get-parallels-info"),
   scan: (): Promise<ScanResult[]> => ipcRenderer.invoke("scan"),
   clean: (ids: string[]): Promise<CleanResult> => ipcRenderer.invoke("clean", ids),
   getStats: (): Promise<SystemStats> => ipcRenderer.invoke("get-stats"),
