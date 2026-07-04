@@ -577,6 +577,46 @@ const SCAN_TARGETS: ScanTarget[] = [
     safe: true,
     platforms: ["win32"],
   },
+  {
+    id: "win-firefox-cache",
+    name: "Firefox Cache",
+    category: "Browser Junk",
+    rawPath: "%APPDATA%\\Mozilla\\Firefox\\Profiles",
+    safe: true,
+    platforms: ["win32"],
+  },
+  {
+    id: "win-update-cache",
+    name: "Windows Update Cache",
+    category: "System Junk",
+    rawPath: "C:\\Windows\\SoftwareDistribution\\Download",
+    safe: true,
+    platforms: ["win32"],
+  },
+  {
+    id: "win-error-reports",
+    name: "Windows Error Reports",
+    category: "System Junk",
+    rawPath: "%LOCALAPPDATA%\\Microsoft\\Windows\\WER",
+    safe: true,
+    platforms: ["win32"],
+  },
+  {
+    id: "win-delivery-opt",
+    name: "Delivery Optimization Cache",
+    category: "System Junk",
+    rawPath: "C:\\Windows\\SoftwareDistribution\\DeliveryOptimization",
+    safe: true,
+    platforms: ["win32"],
+  },
+  {
+    id: "win-crash-dumps",
+    name: "Crash Dumps",
+    category: "System Junk",
+    rawPath: "%LOCALAPPDATA%\\CrashDumps",
+    safe: true,
+    platforms: ["win32"],
+  },
 ];
 
 export function checkFullDiskAccess(): boolean {
@@ -607,34 +647,83 @@ export type ExternalVolume = {
 };
 
 export function listMountedVolumes(): ExternalVolume[] {
-  if (process.platform !== "darwin") return [];
   const results: ExternalVolume[] = [];
-  try {
-    const { execSync } = require("child_process") as typeof import("child_process");
-    const volumes = fs.readdirSync("/Volumes", { withFileTypes: true });
-    for (const vol of volumes) {
-      const volPath = path.join("/Volumes", vol.name);
-      try {
-        const resolved = fs.realpathSync(volPath);
-        if (resolved === "/") continue;
-      } catch { continue; }
-      try {
-        const out = execSync(`df -k "${volPath}" 2>/dev/null | tail -1`, { encoding: "utf8" }).trim();
-        const parts = out.split(/\s+/);
-        const totalKb = parseInt(parts[1] ?? "0", 10);
-        const freeKb  = parseInt(parts[3] ?? "0", 10);
-        results.push({ name: vol.name, path: volPath, totalGb: totalKb / 1024 / 1024, freeGb: freeKb / 1024 / 1024 });
-      } catch {
-        results.push({ name: vol.name, path: volPath, totalGb: 0, freeGb: 0 });
+  const { execSync } = require("child_process") as typeof import("child_process");
+
+  if (process.platform === "darwin") {
+    try {
+      const volumes = fs.readdirSync("/Volumes", { withFileTypes: true });
+      for (const vol of volumes) {
+        const volPath = path.join("/Volumes", vol.name);
+        try {
+          const resolved = fs.realpathSync(volPath);
+          if (resolved === "/") continue;
+        } catch { continue; }
+        try {
+          const out = execSync(`df -k "${volPath}" 2>/dev/null | tail -1`, { encoding: "utf8" }).trim();
+          const parts = out.split(/\s+/);
+          const totalKb = parseInt(parts[1] ?? "0", 10);
+          const freeKb  = parseInt(parts[3] ?? "0", 10);
+          results.push({ name: vol.name, path: volPath, totalGb: totalKb / 1024 / 1024, freeGb: freeKb / 1024 / 1024 });
+        } catch {
+          results.push({ name: vol.name, path: volPath, totalGb: 0, freeGb: 0 });
+        }
       }
-    }
-  } catch { /* /Volumes not accessible */ }
+    } catch { /* /Volumes not accessible */ }
+  } else if (process.platform === "win32") {
+    try {
+      // wmic logicaldisk: DriveType 2=Removable, 3=Fixed (skip C:)
+      const out = execSync("wmic logicaldisk get DeviceID,DriveType,Size,FreeSpace /format:csv", { encoding: "utf8" });
+      for (const line of out.split("\n")) {
+        const cols = line.trim().split(",");
+        if (cols.length < 5) continue;
+        const [, deviceId, driveType, freeSpace, size] = cols;
+        const dt = parseInt(driveType ?? "", 10);
+        if (!deviceId || isNaN(dt)) continue;
+        // Include removable (2) and fixed non-C: drives (3)
+        if (dt !== 2 && !(dt === 3 && deviceId.toUpperCase() !== "C:")) continue;
+        const totalGb = parseInt(size ?? "0", 10) / 1024 / 1024 / 1024;
+        const freeGb  = parseInt(freeSpace ?? "0", 10) / 1024 / 1024 / 1024;
+        results.push({ name: deviceId, path: deviceId + "\\", totalGb, freeGb });
+      }
+    } catch { /* wmic unavailable */ }
+  }
   return results;
 }
 
+const WINDOWS_EXTERNAL_JUNK: { name: string; relPath: string; safe: boolean }[] = [
+  { name: "Recycle Bin",            relPath: "$RECYCLE.BIN",            safe: false },
+  { name: "System Volume Info",     relPath: "System Volume Information", safe: true },
+  { name: "Spotlight Index",        relPath: ".Spotlight-V100",          safe: true },
+  { name: "Temporary Items",        relPath: "FOUND.000",                safe: true },
+];
+
 export function scanExternalDrives(): ScanResult[] {
-  if (process.platform !== "darwin") return [];
   const results: ScanResult[] = [];
+
+  if (process.platform === "win32") {
+    const volumes = listMountedVolumes();
+    for (const vol of volumes) {
+      for (const pattern of WINDOWS_EXTERNAL_JUNK) {
+        const junkPath = path.join(vol.path, pattern.relPath);
+        if (!fs.existsSync(junkPath)) continue;
+        const { sizeMb, fileCount } = getFolderSize(junkPath);
+        if (sizeMb < 0.001) continue;
+        results.push({
+          id: `ext-${vol.name}-${pattern.relPath}`,
+          name: `${pattern.name} (${vol.name})`,
+          category: "External Drives",
+          path: junkPath,
+          sizeMb,
+          fileCount,
+          safe: pattern.safe,
+        });
+      }
+    }
+    return results.sort((a, b) => b.sizeMb - a.sizeMb);
+  }
+
+  if (process.platform !== "darwin") return [];
 
   try {
     const volumes = fs.readdirSync("/Volumes", { withFileTypes: true });
