@@ -57,6 +57,13 @@ export type VirusScanResult = {
   error?: string;
 };
 
+export type ExternalVolume = {
+  name: string;
+  path: string;
+  totalGb: number;
+  freeGb: number;
+};
+
 contextBridge.exposeInMainWorld("cleaner", {
   platform: process.platform,
   checkPermission: (): Promise<boolean> => ipcRenderer.invoke("check-permission"),
@@ -76,4 +83,5 @@ contextBridge.exposeInMainWorld("cleaner", {
   virusScan: (): Promise<VirusScanResult> => ipcRenderer.invoke("virus-scan"),
   quarantineThreat: (threatPath: string): Promise<{ ok: boolean; error?: string }> =>
     ipcRenderer.invoke("quarantine-threat", threatPath),
+  listExternalVolumes: (): Promise<ExternalVolume[]> => ipcRenderer.invoke("list-external-volumes"),
 });

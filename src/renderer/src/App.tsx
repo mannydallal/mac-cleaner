@@ -54,6 +54,13 @@ type VirusScanResult = {
   error?: string;
 };
 
+type ExternalVolume = {
+  name: string;
+  path: string;
+  totalGb: number;
+  freeGb: number;
+};
+
 declare global {
   interface Window {
     cleaner: {
@@ -71,6 +78,7 @@ declare global {
       fixSymlinks: (paths: string[]) => Promise<{ fixed: number; errors: string[] }>;
       virusScan: () => Promise<VirusScanResult>;
       quarantineThreat: (threatPath: string) => Promise<{ ok: boolean; error?: string }>;
+      listExternalVolumes: () => Promise<ExternalVolume[]>;
     };
   }
 }
@@ -368,6 +376,9 @@ export default function App() {
   const [verifying, setVerifying] = useState(false);
   const [fixingSymlinks, setFixingSymlinks] = useState(false);
 
+  // External drives state
+  const [externalVolumes, setExternalVolumes] = useState<ExternalVolume[]>([]);
+
   const platform = window.cleaner?.platform ?? "darwin";
   const isMac = platform === "darwin";
 
@@ -388,6 +399,11 @@ export default function App() {
   useEffect(() => {
     if (tab !== "parallels" || !window.cleaner) return;
     window.cleaner.getParallelsInfo().then(setParallelsInfo).catch(() => {});
+  }, [tab]);
+
+  useEffect(() => {
+    if (tab !== "external" || !window.cleaner) return;
+    window.cleaner.listExternalVolumes().then(setExternalVolumes).catch(() => {});
   }, [tab]);
 
   const handleScan = useCallback(async () => {
@@ -1410,13 +1426,42 @@ export default function App() {
                           </button>
                         </>
                       ) : tab === "external" ? (
-                        <>
-                          <div style={{ fontSize: 48, marginBottom: 16 }}>💾</div>
-                          <div style={{ fontSize: 18, color: S.text, fontWeight: 600 }}>No external drives found</div>
-                          <div style={{ fontSize: 14, marginTop: 8 }}>
-                            Plug in a USB drive, SD card, or external HDD and scan again.
+                        externalVolumes.length > 0 ? (
+                          <div style={{ width: "100%", textAlign: "left" }}>
+                            <div style={{ fontSize: 13, fontWeight: 700, color: S.muted, textTransform: "uppercase", letterSpacing: 0.8, marginBottom: 10 }}>
+                              Connected Drives
+                            </div>
+                            {externalVolumes.map((vol) => {
+                              const usedGb = vol.totalGb - vol.freeGb;
+                              const pct = vol.totalGb > 0 ? Math.round((usedGb / vol.totalGb) * 100) : 0;
+                              return (
+                                <div key={vol.path} style={{ background: S.card, borderRadius: 12, padding: "14px 18px", marginBottom: 10 }}>
+                                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+                                    <span style={{ fontSize: 15, fontWeight: 600, color: S.text }}>💾 {vol.name}</span>
+                                    <span style={{ fontSize: 12, color: S.muted }}>{vol.totalGb > 0 ? `${usedGb.toFixed(1)} GB used of ${vol.totalGb.toFixed(1)} GB` : "Size unknown"}</span>
+                                  </div>
+                                  {vol.totalGb > 0 && (
+                                    <div style={{ height: 6, background: "rgba(0,0,0,0.08)", borderRadius: 3, overflow: "hidden" }}>
+                                      <div style={{ height: "100%", width: `${pct}%`, background: pct > 85 ? S.red : S.green, borderRadius: 3, transition: "width 0.4s" }} />
+                                    </div>
+                                  )}
+                                  <div style={{ fontSize: 12, color: S.green, marginTop: 8 }}>✓ No junk found on this drive</div>
+                                </div>
+                              );
+                            })}
+                            <div style={{ fontSize: 13, color: S.muted, marginTop: 8 }}>
+                              Run a scan to check for hidden junk files on these drives.
+                            </div>
                           </div>
-                        </>
+                        ) : (
+                          <>
+                            <div style={{ fontSize: 48, marginBottom: 16 }}>💾</div>
+                            <div style={{ fontSize: 18, color: S.text, fontWeight: 600 }}>No external drives found</div>
+                            <div style={{ fontSize: 14, marginTop: 8 }}>
+                              Plug in a USB drive, SD card, or external HDD and scan again.
+                            </div>
+                          </>
+                        )
                       ) : (
                         <>
                           <div style={{ fontSize: 48, marginBottom: 16 }}>✨</div>

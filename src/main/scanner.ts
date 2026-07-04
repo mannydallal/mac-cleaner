@@ -599,6 +599,39 @@ const EXTERNAL_JUNK_PATTERNS: { name: string; relPath: string; safe: boolean }[]
   { name: "Volume Cache",        relPath: ".vol",               safe: true  },
 ];
 
+export type ExternalVolume = {
+  name: string;
+  path: string;
+  totalGb: number;
+  freeGb: number;
+};
+
+export function listMountedVolumes(): ExternalVolume[] {
+  if (process.platform !== "darwin") return [];
+  const results: ExternalVolume[] = [];
+  try {
+    const { execSync } = require("child_process") as typeof import("child_process");
+    const volumes = fs.readdirSync("/Volumes", { withFileTypes: true });
+    for (const vol of volumes) {
+      const volPath = path.join("/Volumes", vol.name);
+      try {
+        const resolved = fs.realpathSync(volPath);
+        if (resolved === "/") continue;
+      } catch { continue; }
+      try {
+        const out = execSync(`df -k "${volPath}" 2>/dev/null | tail -1`, { encoding: "utf8" }).trim();
+        const parts = out.split(/\s+/);
+        const totalKb = parseInt(parts[1] ?? "0", 10);
+        const freeKb  = parseInt(parts[3] ?? "0", 10);
+        results.push({ name: vol.name, path: volPath, totalGb: totalKb / 1024 / 1024, freeGb: freeKb / 1024 / 1024 });
+      } catch {
+        results.push({ name: vol.name, path: volPath, totalGb: 0, freeGb: 0 });
+      }
+    }
+  } catch { /* /Volumes not accessible */ }
+  return results;
+}
+
 export function scanExternalDrives(): ScanResult[] {
   if (process.platform !== "darwin") return [];
   const results: ScanResult[] = [];
