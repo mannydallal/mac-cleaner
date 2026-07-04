@@ -589,6 +589,51 @@ export function checkFullDiskAccess(): boolean {
   }
 }
 
+// ── External drive junk patterns ──────────────────────────────────────────────
+
+const EXTERNAL_JUNK_PATTERNS: { name: string; relPath: string; safe: boolean }[] = [
+  { name: "Spotlight Index",     relPath: ".Spotlight-V100",    safe: true  },
+  { name: "File System Events",  relPath: ".fseventsd",         safe: true  },
+  { name: "Drive Trash",         relPath: ".Trashes",           safe: true  },
+  { name: "Temporary Items",     relPath: ".TemporaryItems",    safe: true  },
+  { name: "Volume Cache",        relPath: ".vol",               safe: true  },
+];
+
+export function scanExternalDrives(): ScanResult[] {
+  if (process.platform !== "darwin") return [];
+  const results: ScanResult[] = [];
+
+  try {
+    const volumes = fs.readdirSync("/Volumes", { withFileTypes: true });
+    for (const vol of volumes) {
+      const volPath = path.join("/Volumes", vol.name);
+      try {
+        // Skip the root volume (symlink → /)
+        const resolved = fs.realpathSync(volPath);
+        if (resolved === "/") continue;
+      } catch { continue; }
+
+      for (const pattern of EXTERNAL_JUNK_PATTERNS) {
+        const junkPath = path.join(volPath, pattern.relPath);
+        if (!fs.existsSync(junkPath)) continue;
+        const { sizeMb, fileCount } = getFolderSize(junkPath);
+        if (sizeMb < 0.001) continue;
+        results.push({
+          id: `ext-${vol.name}-${pattern.relPath}`,
+          name: `${pattern.name} (${vol.name})`,
+          category: "External Drives",
+          path: junkPath,
+          sizeMb,
+          fileCount,
+          safe: pattern.safe,
+        });
+      }
+    }
+  } catch { /* /Volumes not accessible */ }
+
+  return results.sort((a, b) => b.sizeMb - a.sizeMb);
+}
+
 export function scanSystem(): ScanResult[] {
   const platform = process.platform as "darwin" | "win32" | "linux";
   const results: ScanResult[] = [];
@@ -609,6 +654,9 @@ export function scanSystem(): ScanResult[] {
       safe: target.safe,
     });
   }
+
+  // Include external drive junk in the full scan
+  results.push(...scanExternalDrives());
 
   return results.sort((a, b) => b.sizeMb - a.sizeMb);
 }

@@ -93,17 +93,18 @@ const S = {
   teal: "#0078A0",
 };
 
-type Tab = "scan-all" | "smart" | "junk" | "privacy" | "parallels" | "uninstaller" | "repair" | "virus";
+type Tab = "scan-all" | "smart" | "junk" | "privacy" | "parallels" | "external" | "uninstaller" | "repair" | "virus";
 
 const NAV: { id: Tab; label: string; emoji: string; color: string }[] = [
-  { id: "scan-all",    label: "Scan All",     emoji: "⚡", color: "#7030B0" },
-  { id: "smart",       label: "Smart Scan",   emoji: "🔍", color: S.green  },
-  { id: "junk",        label: "System Junk",  emoji: "🗑", color: S.orange },
-  { id: "privacy",     label: "Privacy",      emoji: "🔒", color: S.blue   },
-  { id: "parallels",   label: "Parallels",    emoji: "💻", color: S.purple },
-  { id: "uninstaller", label: "Uninstaller",  emoji: "🗂", color: S.red    },
-  { id: "repair",      label: "Disk Health",  emoji: "🔧", color: S.teal   },
-  { id: "virus",       label: "Virus Scan",   emoji: "🛡", color: "#C42020" },
+  { id: "scan-all",    label: "Scan All",        emoji: "⚡", color: "#7030B0" },
+  { id: "smart",       label: "Smart Scan",      emoji: "🔍", color: S.green  },
+  { id: "junk",        label: "System Junk",     emoji: "🗑", color: S.orange },
+  { id: "privacy",     label: "Privacy",         emoji: "🔒", color: S.blue   },
+  { id: "parallels",   label: "Parallels",       emoji: "💻", color: S.purple },
+  { id: "external",    label: "External Drives", emoji: "💾", color: S.teal   },
+  { id: "uninstaller", label: "Uninstaller",     emoji: "🗂", color: S.red    },
+  { id: "repair",      label: "Disk Health",     emoji: "🔧", color: "#0078A0"},
+  { id: "virus",       label: "Virus Scan",      emoji: "🛡", color: "#C42020" },
 ];
 
 function fmtMb(mb: number): string {
@@ -592,6 +593,7 @@ export default function App() {
     if (tab === "junk") return r.category === "System Junk" || r.category === "Browser Junk" || r.category === "Developer Junk";
     if (tab === "privacy") return r.category === "Privacy";
     if (tab === "parallels") return r.category === "Parallels";
+    if (tab === "external") return r.category === "External Drives";
     return true;
   });
 
@@ -1349,6 +1351,14 @@ export default function App() {
                           >
                             Open Privacy &amp; Security Settings
                           </button>
+                        </>
+                      ) : tab === "external" ? (
+                        <>
+                          <div style={{ fontSize: 48, marginBottom: 16 }}>💾</div>
+                          <div style={{ fontSize: 18, color: S.text, fontWeight: 600 }}>No external drives found</div>
+                          <div style={{ fontSize: 14, marginTop: 8 }}>
+                            Plug in a USB drive, SD card, or external HDD and scan again.
+                          </div>
                         </>
                       ) : (
                         <>
