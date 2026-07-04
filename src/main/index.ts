@@ -2,7 +2,7 @@ import { app, BrowserWindow, ipcMain, shell } from "electron";
 import * as path from "path";
 import * as os from "os";
 import * as fs from "fs";
-import { scanSystem, cleanPaths, scanApps, getSizeOf, getDiskHealth, verifyDiskVolume, virusScan, ScanResult, AppInfo } from "./scanner";
+import { scanSystem, cleanPaths, scanApps, getSizeOf, getDiskHealth, verifyDiskVolume, virusScan, checkFullDiskAccess, ScanResult, AppInfo } from "./scanner";
 
 let scanCache: ScanResult[] = [];
 let appCache: AppInfo[] = [];
@@ -41,6 +41,10 @@ app.on("window-all-closed", () => {
 });
 
 // ── IPC handlers ─────────────────────────────────────────────────────────────
+
+ipcMain.handle("check-permission", async () => {
+  return checkFullDiskAccess();
+});
 
 ipcMain.handle("scan", async () => {
   scanCache = scanSystem();

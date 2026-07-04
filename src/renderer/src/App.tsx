@@ -58,6 +58,7 @@ declare global {
   interface Window {
     cleaner: {
       platform: string;
+      checkPermission: () => Promise<boolean>;
       scan: () => Promise<ScanResult[]>;
       clean: (ids: string[]) => Promise<{ freedMb: number; errors: string[] }>;
       getStats: () => Promise<SystemStats>;
@@ -338,6 +339,7 @@ export default function App() {
   const [freedMb, setFreedMb] = useState(0);
   const [toast, setToast] = useState<string | null>(null);
   const [scanDone, setScanDone] = useState(false);
+  const [needsPermission, setNeedsPermission] = useState(false);
 
   // Uninstaller state
   const [appList, setAppList] = useState<AppInfo[]>([]);
@@ -390,6 +392,12 @@ export default function App() {
       setScanResults(results);
       setSelected(new Set(results.filter((r) => r.safe).map((r) => r.id)));
       setScanDone(true);
+      if (results.length === 0 && window.cleaner.platform === "darwin") {
+        const hasAccess = await window.cleaner.checkPermission().catch(() => true);
+        setNeedsPermission(!hasAccess);
+      } else {
+        setNeedsPermission(false);
+      }
     } finally {
       setScanning(false);
     }
@@ -1311,10 +1319,44 @@ export default function App() {
               {scanDone && !scanning && (
                 <>
                   {filteredResults.length === 0 ? (
-                    <div style={{ textAlign: "center", color: S.muted, marginTop: 80 }}>
-                      <div style={{ fontSize: 48, marginBottom: 16 }}>✨</div>
-                      <div style={{ fontSize: 18, color: S.text, fontWeight: 600 }}>All clean!</div>
-                      <div style={{ fontSize: 14, marginTop: 8 }}>No junk found in this category.</div>
+                    <div style={{ textAlign: "center", color: S.muted, marginTop: 60 }}>
+                      {needsPermission ? (
+                        <>
+                          <div style={{ fontSize: 48, marginBottom: 16 }}>🔒</div>
+                          <div style={{ fontSize: 18, color: S.text, fontWeight: 600 }}>Full Disk Access required</div>
+                          <div style={{ fontSize: 14, marginTop: 8, maxWidth: 380, margin: "8px auto 0" }}>
+                            macOS is blocking Mac Cleaner from reading your cache folders.
+                            Grant Full Disk Access and then scan again.
+                          </div>
+                          <div style={{
+                            marginTop: 20, padding: "14px 18px", borderRadius: 12,
+                            background: "rgba(0,0,0,0.06)", textAlign: "left",
+                            maxWidth: 380, margin: "20px auto 0", fontSize: 13, lineHeight: 1.7,
+                          }}>
+                            <strong>How to fix:</strong><br />
+                            1. Open <strong>System Settings</strong><br />
+                            2. Go to <strong>Privacy &amp; Security → Full Disk Access</strong><br />
+                            3. Click <strong>+</strong> and add <strong>Mac Cleaner</strong><br />
+                            4. Restart the app and click <strong>Scan</strong> again
+                          </div>
+                          <button
+                            onClick={() => window.cleaner?.openPath("/System/Library/PreferencePanes/Security.prefPane")}
+                            style={{
+                              marginTop: 18, padding: "10px 22px", borderRadius: 10,
+                              background: S.green, color: "#fff", border: "none",
+                              fontSize: 14, fontWeight: 600, cursor: "pointer",
+                            }}
+                          >
+                            Open Privacy &amp; Security Settings
+                          </button>
+                        </>
+                      ) : (
+                        <>
+                          <div style={{ fontSize: 48, marginBottom: 16 }}>✨</div>
+                          <div style={{ fontSize: 18, color: S.text, fontWeight: 600 }}>All clean!</div>
+                          <div style={{ fontSize: 14, marginTop: 8 }}>No junk found in this category.</div>
+                        </>
+                      )}
                     </div>
                   ) : (
                     categories.map((cat) => (

@@ -579,6 +579,16 @@ const SCAN_TARGETS: ScanTarget[] = [
   },
 ];
 
+export function checkFullDiskAccess(): boolean {
+  try {
+    const cachesPath = path.join(os.homedir(), "Library", "Caches");
+    const entries = fs.readdirSync(cachesPath);
+    return entries.length > 0;
+  } catch {
+    return false;
+  }
+}
+
 export function scanSystem(): ScanResult[] {
   const platform = process.platform as "darwin" | "win32" | "linux";
   const results: ScanResult[] = [];
