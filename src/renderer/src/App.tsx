@@ -19,6 +19,7 @@ type SystemStats = {
   ramTotalGb: number;
   diskUsedGb: number;
   diskTotalGb: number;
+  diskError?: string;
 };
 
 type AppInfo = {
@@ -37,6 +38,7 @@ type DiskHealth = {
   totalGb: number;
   freeGb: number;
   brokenSymlinks: string[];
+  error?: string;
 };
 
 type ThreatItem = {
@@ -61,6 +63,14 @@ type ExternalVolume = {
   freeGb: number;
 };
 
+type UsbDriveFolder = { name: string; path: string; sizeMb: number };
+type UsbDriveJunk   = { name: string; path: string; sizeMb: number; safe: boolean };
+type UsbDriveScanResult = {
+  topFolders: UsbDriveFolder[];
+  junkItems: UsbDriveJunk[];
+  totalJunkMb: number;
+};
+
 declare global {
   interface Window {
     cleaner: {
@@ -78,10 +88,37 @@ declare global {
       fixSymlinks: (paths: string[]) => Promise<{ fixed: number; errors: string[] }>;
       virusScan: () => Promise<VirusScanResult>;
       quarantineThreat: (threatPath: string) => Promise<{ ok: boolean; error?: string }>;
-      listExternalVolumes: () => Promise<ExternalVolume[]>;
+      listExternalVolumes: () => Promise<{ volumes: ExternalVolume[]; error?: string }>;
+      scanUsbDrive: (volPath: string) => Promise<UsbDriveScanResult>;
+      cleanUsbJunk: (paths: string[]) => Promise<{ freedMb: number; errors: string[] }>;
+      scanDuplicates: () => Promise<DuplicateScanResult>;
+      deleteDuplicates: (paths: string[]) => Promise<{ freedMb: number; errors: string[] }>;
+      onScanProgress: (cb: (scanned: number, total: number, currentName: string) => void) => () => void;
+      onVirusScanProgress: (cb: (msg: string, scanned: number) => void) => () => void;
+      onScanDuplicatesProgress: (cb: (scanned: number, total: number, phase: "walk" | "hash") => void) => () => void;
+      onScanAppsProgress: (cb: (scanned: number, total: number, currentName: string) => void) => () => void;
     };
   }
 }
+
+type DuplicateFile = {
+  path: string;
+  name: string;
+  sizeMb: number;
+  modifiedAt: string;
+};
+
+type DuplicateGroup = {
+  hash: string;
+  sizeMb: number;
+  files: DuplicateFile[];
+};
+
+type DuplicateScanResult = {
+  groups: DuplicateGroup[];
+  totalWasteMb: number;
+  scannedCount: number;
+};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -102,13 +139,14 @@ const S = {
   teal: "#0078A0",
 };
 
-type Tab = "scan-all" | "smart" | "junk" | "privacy" | "parallels" | "external" | "uninstaller" | "repair" | "virus";
+type Tab = "scan-all" | "smart" | "junk" | "privacy" | "parallels" | "external" | "uninstaller" | "repair" | "virus" | "duplicates";
 
 const NAV: { id: Tab; label: string; emoji: string; color: string }[] = [
   { id: "scan-all",    label: "Scan All",        emoji: "⚡", color: "#7030B0" },
   { id: "smart",       label: "Smart Scan",      emoji: "🔍", color: S.green  },
   { id: "junk",        label: "System Junk",     emoji: "🗑", color: S.orange },
   { id: "privacy",     label: "Privacy",         emoji: "🔒", color: S.blue   },
+  { id: "duplicates",  label: "Duplicates",      emoji: "👯", color: "#C06800" },
   { id: "parallels",   label: "Parallels",       emoji: "💻", color: S.purple },
   { id: "external",    label: "External Drives", emoji: "💾", color: S.teal   },
   { id: "uninstaller", label: "Uninstaller",     emoji: "🗂", color: S.red    },
@@ -363,6 +401,7 @@ export default function App() {
   const [scanningAll, setScanningAll] = useState(false);
   const [scanAllDone, setScanAllDone] = useState(false);
   const [fixingAll, setFixingAll] = useState(false);
+  const [scanAllVirusPass, setScanAllVirusPass] = useState<string | null>(null);
 
   // Virus scan state
   const [virusResult, setVirusResult] = useState<VirusScanResult | null>(null);
@@ -378,6 +417,26 @@ export default function App() {
 
   // External drives state
   const [externalVolumes, setExternalVolumes] = useState<ExternalVolume[]>([]);
+  const [externalVolumesError, setExternalVolumesError] = useState<string | null>(null);
+  const [usbScanResults, setUsbScanResults] = useState<Record<string, UsbDriveScanResult>>({});
+  const [scanningUsb, setScanningUsb] = useState<Set<string>>(new Set());
+  const [cleaningUsb, setCleaningUsb] = useState<Set<string>>(new Set());
+
+  // Stats error state
+  const [statsError, setStatsError] = useState<string | null>(null);
+
+  // Duplicates state
+  const [dupResult, setDupResult] = useState<DuplicateScanResult | null>(null);
+  const [loadingDups, setLoadingDups] = useState(false);
+  const [dupsDone, setDupsDone] = useState(false);
+  const [dupSelected, setDupSelected] = useState<Set<string>>(new Set());
+  const [deletingDups, setDeletingDups] = useState(false);
+
+  // Progress state
+  const [scanProgress, setScanProgress] = useState<{ scanned: number; total: number; currentName: string } | null>(null);
+  const [virusProgress, setVirusProgress] = useState<{ msg: string; scanned: number } | null>(null);
+  const [dupProgress, setDupProgress] = useState<{ scanned: number; total: number; phase: "walk" | "hash" } | null>(null);
+  const [appsProgress, setAppsProgress] = useState<{ scanned: number; total: number; currentName: string } | null>(null);
 
   const platform = window.cleaner?.platform ?? "darwin";
   const isMac = platform === "darwin";
@@ -389,9 +448,11 @@ export default function App() {
 
   useEffect(() => {
     if (!window.cleaner) return;
-    window.cleaner.getStats().then(setStats).catch(console.error);
+    window.cleaner.getStats().then(s => { setStats(s); setStatsError(null); }).catch((e) => {
+      setStatsError(String(e?.message ?? "Could not load system stats"));
+    });
     const iv = setInterval(() => {
-      window.cleaner.getStats().then(setStats).catch(console.error);
+      window.cleaner.getStats().then(s => { setStats(s); setStatsError(null); }).catch(() => {});
     }, 5000);
     return () => clearInterval(iv);
   }, []);
@@ -403,14 +464,30 @@ export default function App() {
 
   useEffect(() => {
     if (tab !== "external" || !window.cleaner) return;
-    window.cleaner.listExternalVolumes().then(setExternalVolumes).catch(() => {});
+    window.cleaner.listExternalVolumes().then(({ volumes, error }) => {
+      setExternalVolumes(volumes);
+      setExternalVolumesError(error ?? null);
+    }).catch(() => {});
   }, [tab]);
+
+  useEffect(() => {
+    if (!scanningAll || !window.cleaner) return;
+    setScanAllVirusPass(null);
+    const unsub = window.cleaner.onVirusScanProgress((msg) => {
+      setScanAllVirusPass(msg);
+    });
+    return () => { unsub(); };
+  }, [scanningAll]);
 
   const handleScan = useCallback(async () => {
     if (!window.cleaner) return;
     setScanning(true);
     setScanDone(false);
+    setScanProgress(null);
     setSelected(new Set());
+    const unsub = window.cleaner.onScanProgress?.((scanned, total, currentName) => {
+      setScanProgress({ scanned, total, currentName });
+    });
     try {
       const results = await window.cleaner.scan();
       setScanResults(results);
@@ -423,6 +500,8 @@ export default function App() {
         setNeedsPermission(false);
       }
     } finally {
+      unsub?.();
+      setScanProgress(null);
       setScanning(false);
     }
   }, []);
@@ -503,13 +582,61 @@ export default function App() {
     if (!window.cleaner) return;
     setLoadingVirus(true);
     setVirusResult(null);
+    setVirusProgress(null);
+    const unsub = window.cleaner.onVirusScanProgress?.((msg, scanned) => {
+      setVirusProgress({ msg, scanned });
+    });
     try {
       const result = await window.cleaner.virusScan();
       setVirusResult(result);
     } finally {
+      unsub?.();
+      setVirusProgress(null);
       setLoadingVirus(false);
     }
   }, []);
+
+  const handleScanDuplicates = useCallback(async () => {
+    if (!window.cleaner) return;
+    setLoadingDups(true);
+    setDupResult(null);
+    setDupsDone(false);
+    setDupSelected(new Set());
+    setDupProgress(null);
+    const unsub = window.cleaner.onScanDuplicatesProgress?.((scanned, total, phase) => {
+      setDupProgress({ scanned, total, phase });
+    });
+    try {
+      const result = await window.cleaner.scanDuplicates();
+      setDupResult(result);
+      setDupsDone(true);
+    } finally {
+      unsub?.();
+      setDupProgress(null);
+      setLoadingDups(false);
+    }
+  }, []);
+
+  const handleDeleteDuplicates = useCallback(async () => {
+    if (!window.cleaner || dupSelected.size === 0) return;
+    setDeletingDups(true);
+    try {
+      const paths = Array.from(dupSelected);
+      const result = await window.cleaner.deleteDuplicates(paths);
+      showToast(`🗑 Freed ${fmtMb(result.freedMb)} — deleted ${paths.length} duplicate${paths.length > 1 ? "s" : ""}`);
+      setDupResult(prev => {
+        if (!prev) return prev;
+        const groups = prev.groups
+          .map(g => ({ ...g, files: g.files.filter(f => !dupSelected.has(f.path)) }))
+          .filter(g => g.files.length >= 2);
+        const totalWasteMb = groups.reduce((s, g) => s + g.sizeMb * (g.files.length - 1), 0);
+        return { ...prev, groups, totalWasteMb };
+      });
+      setDupSelected(new Set());
+    } finally {
+      setDeletingDups(false);
+    }
+  }, [dupSelected]);
 
   const handleQuarantine = useCallback(async (threat: ThreatItem) => {
     if (!window.cleaner) return;
@@ -573,11 +700,17 @@ export default function App() {
     if (!window.cleaner) return;
     setLoadingApps(true);
     setAppsDone(false);
+    setAppsProgress(null);
+    const unsub = window.cleaner.onScanAppsProgress?.((scanned, total, currentName) => {
+      setAppsProgress({ scanned, total, currentName });
+    });
     try {
       const apps = await window.cleaner.scanApps();
       setAppList(apps);
       setAppsDone(true);
     } finally {
+      unsub?.();
+      setAppsProgress(null);
       setLoadingApps(false);
     }
   }, []);
@@ -597,6 +730,36 @@ export default function App() {
       }
     } finally {
       setUninstallingApp(null);
+    }
+  }, []);
+
+  const handleScanUsb = useCallback(async (volPath: string) => {
+    if (!window.cleaner) return;
+    setScanningUsb(prev => new Set(prev).add(volPath));
+    try {
+      const result = await window.cleaner.scanUsbDrive(volPath);
+      setUsbScanResults(prev => ({ ...prev, [volPath]: result }));
+    } finally {
+      setScanningUsb(prev => { const s = new Set(prev); s.delete(volPath); return s; });
+    }
+  }, []);
+
+  const handleCleanUsbJunk = useCallback(async (volPath: string, junkPaths: string[]) => {
+    if (!window.cleaner) return;
+    setCleaningUsb(prev => new Set(prev).add(volPath));
+    try {
+      const result = await window.cleaner.cleanUsbJunk(junkPaths);
+      setFreedMb(prev => prev + result.freedMb);
+      if (result.errors.length > 0) {
+        showToast(`⚠ Some items could not be moved: ${result.errors[0]}`);
+      } else {
+        showToast(`Freed ${fmtMb(result.freedMb)} from drive junk — empty Trash to reclaim space`);
+      }
+      // Re-scan the drive to refresh the view
+      const fresh = await window.cleaner.scanUsbDrive(volPath);
+      setUsbScanResults(prev => ({ ...prev, [volPath]: fresh }));
+    } finally {
+      setCleaningUsb(prev => { const s = new Set(prev); s.delete(volPath); return s; });
     }
   }, []);
 
@@ -624,11 +787,12 @@ export default function App() {
   const selectedMb = scanResults.filter((r) => selected.has(r.id)).reduce((s, r) => s + r.sizeMb, 0);
   const totalFoundMb = filteredResults.reduce((s, r) => s + r.sizeMb, 0);
 
-  const diskPct = stats ? Math.round((stats.diskUsedGb / stats.diskTotalGb) * 100) : 0;
+  const diskPct = stats && stats.diskTotalGb > 0 ? Math.round((stats.diskUsedGb / stats.diskTotalGb) * 100) : 0;
   const ramPct = stats ? Math.round((stats.ramUsedGb / stats.ramTotalGb) * 100) : 0;
 
   const isUninstallerTab = tab === "uninstaller";
-  const isRepairTab = tab === "repair";
+  const isRepairTab      = tab === "repair";
+  const isExternalTab    = tab === "external";
 
   return (
     <div style={{ display: "flex", height: "100vh", background: S.bgGrad, overflow: "hidden", position: "relative" }}>
@@ -707,7 +871,17 @@ export default function App() {
           <div style={{ marginTop: "auto", display: "flex", flexDirection: "column", gap: 10 }}>
             <div style={{ height: 1, background: S.border, margin: "0 4px" }} />
             <div style={{ padding: "10px 6px" }}>
-              <MiniStat label="Disk" used={fmtGb(stats.diskUsedGb)} total={fmtGb(stats.diskTotalGb)} pct={diskPct} color={diskPct > 85 ? S.red : diskPct > 70 ? S.orange : S.green} />
+              {stats.diskError ? (
+                <div style={{ marginBottom: 10 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
+                    <span style={{ fontSize: 11, color: S.muted }}>Disk</span>
+                    <span style={{ fontSize: 11, color: S.orange }}>⚠ Unavailable</span>
+                  </div>
+                  <div style={{ fontSize: 10, color: S.orange, lineHeight: 1.4 }}>{stats.diskError}</div>
+                </div>
+              ) : (
+                <MiniStat label="Disk" used={fmtGb(stats.diskUsedGb)} total={fmtGb(stats.diskTotalGb)} pct={diskPct} color={diskPct > 85 ? S.red : diskPct > 70 ? S.orange : S.green} />
+              )}
               <MiniStat label="RAM" used={fmtGb(stats.ramUsedGb)} total={fmtGb(stats.ramTotalGb)} pct={ramPct} color={ramPct > 85 ? S.red : S.blue} />
               <MiniStat label="CPU" used={`${stats.cpuPercent}%`} total="" pct={stats.cpuPercent} color={stats.cpuPercent > 80 ? S.red : S.teal} />
             </div>
@@ -790,6 +964,33 @@ export default function App() {
               >
                 {loadingHealth ? "Scanning…" : "Scan Disk"}
               </button>
+            ) : tab === "duplicates" ? (
+              <div style={{ display: "flex", gap: 8 }}>
+                <button
+                  onClick={handleScanDuplicates}
+                  disabled={loadingDups}
+                  style={{
+                    padding: "9px 20px", borderRadius: 10, border: "none",
+                    background: "rgba(255,255,255,0.1)", color: S.text, fontSize: 14, fontWeight: 600,
+                    cursor: loadingDups ? "not-allowed" : "pointer", opacity: loadingDups ? 0.6 : 1,
+                  }}
+                >
+                  {loadingDups ? "Scanning…" : "Scan for Duplicates"}
+                </button>
+                {dupSelected.size > 0 && (
+                  <button
+                    onClick={handleDeleteDuplicates}
+                    disabled={deletingDups}
+                    style={{
+                      padding: "9px 20px", borderRadius: 10, border: "none",
+                      background: "#C42020", color: "#fff", fontSize: 14, fontWeight: 700,
+                      cursor: deletingDups ? "not-allowed" : "pointer", opacity: deletingDups ? 0.6 : 1,
+                    }}
+                  >
+                    {deletingDups ? "Deleting…" : `Delete ${dupSelected.size} Selected`}
+                  </button>
+                )}
+              </div>
             ) : isUninstallerTab ? (
               <button
                 onClick={handleScanApps}
@@ -800,8 +1001,14 @@ export default function App() {
                   cursor: loadingApps ? "not-allowed" : "pointer", opacity: loadingApps ? 0.6 : 1,
                 }}
               >
-                {loadingApps ? "Scanning…" : "Scan Apps"}
+                {loadingApps
+                  ? (appsProgress && appsProgress.total > 0
+                      ? `Scanning ${appsProgress.scanned} / ${appsProgress.total}…`
+                      : "Scanning…")
+                  : "Scan Apps"}
               </button>
+            ) : isExternalTab ? (
+              null
             ) : (
               <>
                 <button
@@ -851,8 +1058,28 @@ export default function App() {
               {loadingApps && (
                 <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "100%", gap: 16 }}>
                   <div style={{ width: 60, height: 60, borderRadius: "50%", border: `4px solid rgba(255,255,255,0.08)`, borderTop: `4px solid ${S.red}`, animation: "spin 0.8s linear infinite" }} />
-                  <div style={{ color: S.muted, fontSize: 15 }}>Scanning Applications…</div>
                   <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
+                  {appsProgress && appsProgress.total > 0 ? (
+                    <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 8, width: 320 }}>
+                      <div style={{ color: S.text, fontSize: 15, fontWeight: 600 }}>
+                        Scanning {appsProgress.scanned} / {appsProgress.total} apps…
+                      </div>
+                      <div style={{ color: S.muted, fontSize: 12, maxWidth: 280, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", textAlign: "center" }}>
+                        {appsProgress.currentName}
+                      </div>
+                      <div style={{ width: "100%", height: 6, borderRadius: 3, background: "rgba(255,255,255,0.1)", overflow: "hidden" }}>
+                        <div style={{
+                          height: "100%",
+                          borderRadius: 3,
+                          background: S.red,
+                          width: `${Math.round((appsProgress.scanned / appsProgress.total) * 100)}%`,
+                          transition: "width 0.2s ease",
+                        }} />
+                      </div>
+                    </div>
+                  ) : (
+                    <div style={{ color: S.muted, fontSize: 15 }}>Scanning Applications…</div>
+                  )}
                 </div>
               )}
               {appsDone && !loadingApps && (
@@ -868,6 +1095,148 @@ export default function App() {
                   ))}
                 </div>
               )}
+            </>
+          )}
+
+          {/* ── External Drives / USB tab ── */}
+          {isExternalTab && (
+            <>
+              {externalVolumesError && (
+                <div style={{ textAlign: "center", padding: 40 }}>
+                  <div style={{ fontSize: 48, marginBottom: 12 }}>⚠️</div>
+                  <div style={{ fontSize: 16, color: S.orange, fontWeight: 600 }}>{externalVolumesError}</div>
+                </div>
+              )}
+              {!externalVolumesError && externalVolumes.length === 0 && (
+                <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "100%", gap: 12 }}>
+                  <div style={{ fontSize: 48 }}>💾</div>
+                  <div style={{ fontSize: 16, color: S.text, fontWeight: 600 }}>No external drives found</div>
+                  <div style={{ fontSize: 13, color: S.muted }}>Plug in a USB drive, SD card, or external HDD and scan again.</div>
+                </div>
+              )}
+              {externalVolumes.map((vol) => {
+                const usedGb = vol.totalGb - vol.freeGb;
+                const pct = vol.totalGb > 0 ? Math.round((usedGb / vol.totalGb) * 100) : 0;
+                const scanResult = usbScanResults[vol.path];
+                const isScanning = scanningUsb.has(vol.path);
+                const isCleaning = cleaningUsb.has(vol.path);
+                return (
+                  <div key={vol.path} style={{ background: S.card, borderRadius: 14, padding: "18px 20px", marginBottom: 16 }}>
+                    {/* Drive header */}
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+                      <div>
+                        <span style={{ fontSize: 16, fontWeight: 700, color: S.text }}>💾 {vol.name}</span>
+                        {vol.totalGb > 0 && (
+                          <span style={{ fontSize: 12, color: S.muted, marginLeft: 10 }}>
+                            {usedGb.toFixed(1)} GB used of {vol.totalGb.toFixed(1)} GB
+                          </span>
+                        )}
+                      </div>
+                      <button
+                        onClick={() => handleScanUsb(vol.path)}
+                        disabled={isScanning || isCleaning}
+                        style={{
+                          padding: "6px 16px", borderRadius: 8, border: "none",
+                          background: S.teal + "22", color: S.teal,
+                          fontSize: 13, fontWeight: 600,
+                          cursor: isScanning || isCleaning ? "not-allowed" : "pointer",
+                          opacity: isScanning || isCleaning ? 0.6 : 1,
+                        }}
+                      >
+                        {isScanning ? "Scanning…" : scanResult ? "Re-scan" : "Scan Drive"}
+                      </button>
+                    </div>
+
+                    {/* Capacity bar */}
+                    {vol.totalGb > 0 && (
+                      <div style={{ height: 6, background: "rgba(0,0,0,0.08)", borderRadius: 3, overflow: "hidden", marginBottom: 14 }}>
+                        <div style={{ height: "100%", width: `${pct}%`, background: pct > 85 ? S.red : S.teal, borderRadius: 3, transition: "width 0.4s" }} />
+                      </div>
+                    )}
+
+                    {/* Scanning spinner */}
+                    {isScanning && (
+                      <div style={{ display: "flex", alignItems: "center", gap: 10, color: S.muted, fontSize: 13, padding: "8px 0" }}>
+                        <div style={{ width: 16, height: 16, borderRadius: "50%", border: `2px solid rgba(0,0,0,0.08)`, borderTop: `2px solid ${S.teal}`, animation: "spin 0.8s linear infinite", flexShrink: 0 }} />
+                        Scanning drive contents…
+                      </div>
+                    )}
+
+                    {/* Scan results */}
+                    {!isScanning && scanResult && (
+                      <>
+                        {/* Top folders breakdown */}
+                        {scanResult.topFolders.length > 0 && (
+                          <div style={{ marginBottom: 14 }}>
+                            <div style={{ fontSize: 11, fontWeight: 700, color: S.muted, textTransform: "uppercase", letterSpacing: 0.8, marginBottom: 8 }}>
+                              What's on this drive
+                            </div>
+                            {scanResult.topFolders.slice(0, 8).map((folder) => {
+                              const folderPct = vol.totalGb > 0 ? Math.min(100, (folder.sizeMb / 1024 / vol.totalGb) * 100) : 0;
+                              return (
+                                <div key={folder.path} style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 6 }}>
+                                  <div style={{ fontSize: 12, color: S.text, flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                                    {folder.name}
+                                  </div>
+                                  <div style={{ width: 80, height: 4, background: "rgba(0,0,0,0.06)", borderRadius: 2, overflow: "hidden", flexShrink: 0 }}>
+                                    <div style={{ height: "100%", width: `${folderPct}%`, background: S.teal, borderRadius: 2 }} />
+                                  </div>
+                                  <div style={{ fontSize: 12, color: S.muted, width: 58, textAlign: "right", flexShrink: 0 }}>{fmtMb(folder.sizeMb)}</div>
+                                  <button
+                                    onClick={() => revealPath(folder.path)}
+                                    style={{ background: "rgba(0,0,0,0.04)", border: "none", borderRadius: 5, color: S.muted, fontSize: 10, padding: "2px 7px", cursor: "pointer", flexShrink: 0 }}
+                                  >
+                                    Show
+                                  </button>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        )}
+
+                        {/* Junk items */}
+                        {scanResult.junkItems.length > 0 ? (
+                          <div style={{ background: S.card2, borderRadius: 10, padding: "12px 14px" }}>
+                            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+                              <div style={{ fontSize: 12, fontWeight: 700, color: S.orange }}>
+                                🗑 {fmtMb(scanResult.totalJunkMb)} of hidden junk found
+                              </div>
+                              <button
+                                onClick={() => handleCleanUsbJunk(vol.path, scanResult.junkItems.map(j => j.path))}
+                                disabled={isCleaning}
+                                style={{
+                                  padding: "5px 14px", borderRadius: 7, border: "none",
+                                  background: S.red, color: "#fff",
+                                  fontSize: 12, fontWeight: 700,
+                                  cursor: isCleaning ? "not-allowed" : "pointer",
+                                  opacity: isCleaning ? 0.6 : 1,
+                                }}
+                              >
+                                {isCleaning ? "Cleaning…" : "Clean Junk"}
+                              </button>
+                            </div>
+                            {scanResult.junkItems.map((item) => (
+                              <div key={item.path} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "5px 0", borderTop: `1px solid ${S.border}` }}>
+                                <span style={{ fontSize: 12, color: S.text }}>{item.name}</span>
+                                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                                  {!item.safe && <span style={{ fontSize: 10, color: S.orange }}>Review</span>}
+                                  <span style={{ fontSize: 12, color: S.muted }}>{fmtMb(item.sizeMb)}</span>
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        ) : (
+                          <div style={{ fontSize: 13, color: S.green, fontWeight: 600 }}>✓ No hidden junk found on this drive</div>
+                        )}
+
+                        {scanResult.topFolders.length === 0 && scanResult.junkItems.length === 0 && (
+                          <div style={{ fontSize: 13, color: S.muted }}>Drive appears empty or contents are not accessible.</div>
+                        )}
+                      </>
+                    )}
+                  </div>
+                );
+              })}
             </>
           )}
 
@@ -891,6 +1260,29 @@ export default function App() {
               )}
               {diskHealth && !loadingHealth && (
                 <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+
+                  {/* Error banner (e.g. wmic unavailable on Windows) */}
+                  {diskHealth.error && (
+                    <div style={{
+                      background: S.orange + "18",
+                      border: `1px solid ${S.orange}44`,
+                      borderRadius: 12,
+                      padding: "14px 18px",
+                      display: "flex",
+                      alignItems: "flex-start",
+                      gap: 12,
+                    }}>
+                      <span style={{ fontSize: 20, flexShrink: 0 }}>⚠️</span>
+                      <div>
+                        <div style={{ fontSize: 14, fontWeight: 700, color: S.orange, marginBottom: 4 }}>
+                          Could not read disk info
+                        </div>
+                        <div style={{ fontSize: 12, color: S.muted, lineHeight: 1.5 }}>
+                          {diskHealth.error}
+                        </div>
+                      </div>
+                    </div>
+                  )}
 
                   {/* SMART status card */}
                   <div style={{ background: S.card, borderRadius: 14, padding: "20px 24px", display: "flex", alignItems: "center", gap: 20 }}>
@@ -1034,6 +1426,11 @@ export default function App() {
                       </div>
                     ))}
                   </div>
+                  {scanAllVirusPass && (
+                    <div style={{ fontSize: 12, color: "#7030B0", background: "rgba(112,48,176,0.1)", borderRadius: 8, padding: "7px 14px", maxWidth: 340, textAlign: "center", lineHeight: 1.5 }}>
+                      🛡 {scanAllVirusPass}
+                    </div>
+                  )}
                 </div>
               )}
 
@@ -1199,9 +1596,22 @@ export default function App() {
                 <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "100%", gap: 16 }}>
                   <div style={{ width: 60, height: 60, borderRadius: "50%", border: `4px solid rgba(255,255,255,0.08)`, borderTop: `4px solid #FF453A`, animation: "spin 0.8s linear infinite" }} />
                   <div style={{ color: S.text, fontSize: 16, fontWeight: 700 }}>Scanning for threats…</div>
-                  <div style={{ color: S.muted, fontSize: 13 }}>
-                    {isMac ? "Checking LaunchAgents, Applications, and known malware paths" : "Running Windows Defender + scanning startup locations"}
-                  </div>
+                  {virusProgress ? (
+                    <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 4 }}>
+                      <div style={{ color: S.muted, fontSize: 13, textAlign: "center", maxWidth: 360 }}>
+                        {virusProgress.msg}
+                      </div>
+                      <div style={{ color: S.muted, fontSize: 12, fontWeight: 600 }}>
+                        {virusProgress.scanned.toLocaleString()} files scanned
+                      </div>
+                    </div>
+                  ) : (
+                    <div style={{ color: S.muted, fontSize: 13, textAlign: "center", maxWidth: 340 }}>
+                      {isMac
+                        ? "Checking LaunchAgents, Applications, and known malware paths"
+                        : "Running Windows Defender + scanning startup locations"}
+                    </div>
+                  )}
                   <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
                 </div>
               )}
@@ -1288,8 +1698,174 @@ export default function App() {
             </>
           )}
 
+          {/* ── Duplicates tab ── */}
+          {tab === "duplicates" && (
+            <>
+              {!loadingDups && !dupsDone && (
+                <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "100%", gap: 16 }}>
+                  <div style={{ fontSize: 52 }}>👯</div>
+                  <div style={{ fontSize: 16, fontWeight: 700, color: S.text }}>Duplicate File Finder</div>
+                  <div style={{ fontSize: 14, color: S.muted, textAlign: "center", maxWidth: 380 }}>
+                    Scans Desktop, Documents, Downloads, Pictures, Music, and Movies for exact duplicate files using SHA-256 hashing.
+                  </div>
+                  <div style={{ fontSize: 12, color: S.muted, marginTop: 4 }}>Click <strong style={{ color: S.text }}>Scan for Duplicates</strong> to start</div>
+                </div>
+              )}
+              {loadingDups && (
+                <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "100%", gap: 16 }}>
+                  <div style={{ width: 60, height: 60, borderRadius: "50%", border: `4px solid rgba(0,0,0,0.06)`, borderTop: `4px solid ${S.orange}`, animation: "spin 0.8s linear infinite" }} />
+                  <div style={{ color: S.text, fontSize: 16, fontWeight: 700 }}>Scanning for duplicates…</div>
+                  {dupProgress ? (
+                    <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 6 }}>
+                      <div style={{ color: S.muted, fontSize: 13 }}>
+                        {dupProgress.phase === "walk"
+                          ? `Indexing files… ${dupProgress.scanned.toLocaleString()} / ${dupProgress.total.toLocaleString()}`
+                          : `Hashing for duplicates… ${dupProgress.scanned.toLocaleString()} / ${dupProgress.total.toLocaleString()}`}
+                      </div>
+                      {dupProgress.total > 0 && (
+                        <div style={{ width: 200, height: 4, borderRadius: 2, background: "rgba(0,0,0,0.08)", overflow: "hidden" }}>
+                          <div style={{
+                            height: "100%", borderRadius: 2, background: S.orange,
+                            width: `${Math.min(100, Math.round((dupProgress.scanned / dupProgress.total) * 100))}%`,
+                            transition: "width 0.3s ease",
+                          }} />
+                        </div>
+                      )}
+                    </div>
+                  ) : (
+                    <div style={{ color: S.muted, fontSize: 13 }}>Hashing files in Desktop, Documents, Downloads, Pictures, Music, Movies</div>
+                  )}
+                  <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
+                </div>
+              )}
+              {dupsDone && dupResult && (
+                <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+                  {/* Summary bar */}
+                  <div style={{ background: S.card, borderRadius: 14, padding: "16px 20px", display: "flex", alignItems: "center", gap: 24 }}>
+                    <div style={{ textAlign: "center" }}>
+                      <div style={{ fontSize: 22, fontWeight: 800, color: S.text }}>{dupResult.groups.length}</div>
+                      <div style={{ fontSize: 11, color: S.muted }}>Duplicate Groups</div>
+                    </div>
+                    <div style={{ width: 1, height: 36, background: S.border }} />
+                    <div style={{ textAlign: "center" }}>
+                      <div style={{ fontSize: 22, fontWeight: 800, color: S.orange }}>{fmtMb(dupResult.totalWasteMb)}</div>
+                      <div style={{ fontSize: 11, color: S.muted }}>Wasted Space</div>
+                    </div>
+                    <div style={{ width: 1, height: 36, background: S.border }} />
+                    <div style={{ textAlign: "center" }}>
+                      <div style={{ fontSize: 22, fontWeight: 800, color: S.text }}>{dupResult.scannedCount.toLocaleString()}</div>
+                      <div style={{ fontSize: 11, color: S.muted }}>Files Scanned</div>
+                    </div>
+                    {dupResult.groups.length > 0 && (
+                      <>
+                        <div style={{ flex: 1 }} />
+                        <button
+                          onClick={() => {
+                            const allDups = new Set<string>();
+                            dupResult.groups.forEach(g => g.files.slice(1).forEach(f => allDups.add(f.path)));
+                            setDupSelected(allDups);
+                          }}
+                          style={{ padding: "7px 16px", borderRadius: 8, border: `1px solid ${S.border}`, background: "transparent", color: S.text, fontSize: 13, fontWeight: 600, cursor: "pointer" }}
+                        >
+                          Select All Duplicates
+                        </button>
+                        <button
+                          onClick={() => setDupSelected(new Set())}
+                          style={{ padding: "7px 16px", borderRadius: 8, border: `1px solid ${S.border}`, background: "transparent", color: S.muted, fontSize: 13, cursor: "pointer" }}
+                        >
+                          Clear
+                        </button>
+                      </>
+                    )}
+                  </div>
+
+                  {dupResult.groups.length === 0 ? (
+                    <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: "60px 0", gap: 12 }}>
+                      <div style={{ fontSize: 48 }}>✨</div>
+                      <div style={{ fontSize: 18, color: S.text, fontWeight: 600 }}>No duplicates found!</div>
+                      <div style={{ fontSize: 14, color: S.muted }}>All files in your common folders are unique.</div>
+                    </div>
+                  ) : (
+                    dupResult.groups.map((group, gi) => (
+                      <div key={group.hash} style={{ background: S.card, borderRadius: 14, overflow: "hidden" }}>
+                        <div style={{ padding: "12px 20px", background: S.card2, borderBottom: `1px solid ${S.border}`, display: "flex", alignItems: "center", gap: 10 }}>
+                          <span style={{ fontSize: 13, fontWeight: 700, color: S.text }}>{group.files.length} identical files</span>
+                          <span style={{ fontSize: 12, color: S.muted }}>·</span>
+                          <span style={{ fontSize: 12, color: S.orange, fontWeight: 600 }}>{fmtMb(group.sizeMb)} each</span>
+                          <span style={{ fontSize: 12, color: S.muted }}>·</span>
+                          <span style={{ fontSize: 12, color: S.muted }}>wasting {fmtMb(group.sizeMb * (group.files.length - 1))}</span>
+                        </div>
+                        {group.files.map((file, fi) => {
+                          const isSelected = dupSelected.has(file.path);
+                          const isFirst = fi === 0;
+                          return (
+                            <div key={file.path}
+                              onClick={() => {
+                                setDupSelected(prev => {
+                                  const next = new Set(prev);
+                                  if (next.has(file.path)) next.delete(file.path);
+                                  else next.add(file.path);
+                                  return next;
+                                });
+                              }}
+                              style={{
+                                padding: "12px 20px",
+                                borderBottom: fi < group.files.length - 1 ? `1px solid ${S.border}` : "none",
+                                display: "flex", alignItems: "center", gap: 14, cursor: "pointer",
+                                background: isSelected ? "#FF453A11" : "transparent",
+                                transition: "background 0.15s",
+                              }}
+                            >
+                              <div style={{
+                                width: 18, height: 18, borderRadius: 4, border: `2px solid ${isSelected ? "#C42020" : S.border}`,
+                                background: isSelected ? "#C42020" : "transparent", flexShrink: 0,
+                                display: "flex", alignItems: "center", justifyContent: "center",
+                              }}>
+                                {isSelected && <span style={{ color: "#fff", fontSize: 11, fontWeight: 900 }}>✓</span>}
+                              </div>
+                              <div style={{ flex: 1, minWidth: 0 }}>
+                                <div style={{ fontSize: 13, fontWeight: 600, color: S.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                                  {file.name}
+                                  {isFirst && <span style={{ marginLeft: 8, fontSize: 10, fontWeight: 700, padding: "2px 6px", borderRadius: 6, background: "#1A8C3822", color: S.green }}>KEEP (newest)</span>}
+                                </div>
+                                <div style={{ fontSize: 11, color: S.muted, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", marginTop: 2 }}>{file.path}</div>
+                              </div>
+                              <div style={{ fontSize: 12, color: S.muted, flexShrink: 0 }}>
+                                {new Date(file.modifiedAt).toLocaleDateString()}
+                              </div>
+                              <button
+                                onClick={e => { e.stopPropagation(); window.cleaner.openPath(file.path); }}
+                                style={{ padding: "4px 10px", borderRadius: 6, border: `1px solid ${S.border}`, background: "transparent", color: S.muted, fontSize: 11, cursor: "pointer" }}
+                              >
+                                Show
+                              </button>
+                            </div>
+                          );
+                        })}
+                        <div style={{ padding: "10px 20px", borderTop: `1px solid ${S.border}`, display: "flex", gap: 8 }}>
+                          <button
+                            onClick={() => {
+                              setDupSelected(prev => {
+                                const next = new Set(prev);
+                                group.files.slice(1).forEach(f => next.add(f.path));
+                                return next;
+                              });
+                            }}
+                            style={{ padding: "5px 12px", borderRadius: 7, border: `1px solid ${S.border}`, background: "transparent", color: S.text, fontSize: 12, cursor: "pointer" }}
+                          >
+                            Select duplicates in group #{gi + 1}
+                          </button>
+                        </div>
+                      </div>
+                    ))
+                  )}
+                </div>
+              )}
+            </>
+          )}
+
           {/* ── Cleaner tabs ── */}
-          {!isUninstallerTab && !isRepairTab && tab !== "virus" && (
+          {!isUninstallerTab && !isRepairTab && !isExternalTab && tab !== "virus" && tab !== "duplicates" && (
             <>
               {/* Parallels version + VM banner */}
               {tab === "parallels" && parallelsInfo && (
@@ -1367,9 +1943,35 @@ export default function App() {
                       <circle cx="22" cy="95" r="3" fill={S.blue}/>
                     </svg>
                   </div>
+                  {statsError && (
+                    <div style={{
+                      background: S.orange + "18", border: `1px solid ${S.orange}44`,
+                      borderRadius: 12, padding: "12px 18px", display: "flex", alignItems: "center", gap: 10, maxWidth: 440,
+                    }}>
+                      <span style={{ fontSize: 18, flexShrink: 0 }}>⚠️</span>
+                      <div style={{ fontSize: 12, color: S.orange, lineHeight: 1.5 }}>
+                        <strong>Could not load system stats</strong><br />{statsError}
+                      </div>
+                    </div>
+                  )}
                   {stats && (
                     <div style={{ display: "flex", gap: 36, marginBottom: 4 }}>
-                      <StatRing percent={diskPct} label="Disk" color={diskPct > 85 ? S.red : diskPct > 70 ? S.orange : S.green} sub={`${fmtGb(stats.diskUsedGb)} / ${fmtGb(stats.diskTotalGb)}`} />
+                      {stats.diskError ? (
+                        <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 6 }}>
+                          <div style={{
+                            width: 96, height: 96, borderRadius: "50%",
+                            border: `3px dashed ${S.orange}66`,
+                            display: "flex", alignItems: "center", justifyContent: "center",
+                            fontSize: 28,
+                          }}>⚠️</div>
+                          <div style={{ textAlign: "center" }}>
+                            <div style={{ fontSize: 12, fontWeight: 600, color: S.text }}>Disk</div>
+                            <div style={{ fontSize: 10, color: S.orange, maxWidth: 100, lineHeight: 1.4 }}>Could not read disk info — run as administrator</div>
+                          </div>
+                        </div>
+                      ) : (
+                        <StatRing percent={diskPct} label="Disk" color={diskPct > 85 ? S.red : diskPct > 70 ? S.orange : S.green} sub={`${fmtGb(stats.diskUsedGb)} / ${fmtGb(stats.diskTotalGb)}`} />
+                      )}
                       <StatRing percent={ramPct} label="Memory" color={ramPct > 85 ? S.red : S.blue} sub={`${fmtGb(stats.ramUsedGb)} / ${fmtGb(stats.ramTotalGb)}`} />
                       <StatRing percent={stats.cpuPercent} label="CPU" color={stats.cpuPercent > 80 ? S.red : S.teal} sub={`${stats.cpuPercent}% used`} />
                     </div>
@@ -1387,7 +1989,28 @@ export default function App() {
               {scanning && (
                 <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "100%", gap: 16 }}>
                   <div style={{ width: 60, height: 60, borderRadius: "50%", border: `4px solid rgba(255,255,255,0.08)`, borderTop: `4px solid ${S.green}`, animation: "spin 0.8s linear infinite" }} />
-                  <div style={{ color: S.muted, fontSize: 15 }}>Scanning…</div>
+                  <div style={{ color: S.text, fontSize: 15, fontWeight: 600 }}>Scanning…</div>
+                  {scanProgress ? (
+                    <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 6 }}>
+                      <div style={{ color: S.muted, fontSize: 13 }}>
+                        Scanned {scanProgress.scanned} / {scanProgress.total} directories
+                      </div>
+                      <div style={{ color: S.muted, fontSize: 12, maxWidth: 280, textAlign: "center", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                        {scanProgress.currentName}
+                      </div>
+                      {scanProgress.total > 0 && (
+                        <div style={{ width: 200, height: 4, borderRadius: 2, background: "rgba(0,0,0,0.08)", overflow: "hidden" }}>
+                          <div style={{
+                            height: "100%", borderRadius: 2, background: S.green,
+                            width: `${Math.min(100, Math.round((scanProgress.scanned / scanProgress.total) * 100))}%`,
+                            transition: "width 0.3s ease",
+                          }} />
+                        </div>
+                      )}
+                    </div>
+                  ) : (
+                    <div style={{ color: S.muted, fontSize: 13 }}>Checking system directories…</div>
+                  )}
                   <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
                 </div>
               )}
@@ -1453,6 +2076,14 @@ export default function App() {
                               Run a scan to check for hidden junk files on these drives.
                             </div>
                           </div>
+                        ) : externalVolumesError ? (
+                          <>
+                            <div style={{ fontSize: 48, marginBottom: 16 }}>⚠️</div>
+                            <div style={{ fontSize: 18, color: S.orange, fontWeight: 600 }}>Could not detect drives</div>
+                            <div style={{ fontSize: 13, marginTop: 8, maxWidth: 360, color: S.muted, lineHeight: 1.6 }}>
+                              {externalVolumesError}
+                            </div>
+                          </>
                         ) : (
                           <>
                             <div style={{ fontSize: 48, marginBottom: 16 }}>💾</div>

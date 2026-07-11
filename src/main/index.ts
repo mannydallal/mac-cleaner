@@ -2,7 +2,11 @@ import { app, BrowserWindow, ipcMain, shell } from "electron";
 import * as path from "path";
 import * as os from "os";
 import * as fs from "fs";
-import { scanSystem, cleanPaths, scanApps, getSizeOf, getDiskHealth, verifyDiskVolume, virusScan, checkFullDiskAccess, getParallelsInfo, listMountedVolumes, ScanResult, AppInfo } from "./scanner";
+import { promisify } from "util";
+import { exec } from "child_process";
+import { scanSystem, cleanPaths, scanApps, getSizeOf, getDiskHealth, verifyDiskVolume, virusScan, checkFullDiskAccess, getParallelsInfo, listMountedVolumes, findDuplicates, deleteDuplicateFiles, scanUsbDrive, ScanResult, AppInfo } from "./scanner";
+
+const execAsync = promisify(exec);
 
 let scanCache: ScanResult[] = [];
 let appCache: AppInfo[] = [];
@@ -47,22 +51,24 @@ ipcMain.handle("check-permission", async () => {
 });
 
 ipcMain.handle("list-external-volumes", async () => {
-  return listMountedVolumes();
+  const result = await listMountedVolumes();
+  return result;
 });
 
 ipcMain.handle("get-parallels-info", async () => {
-  return getParallelsInfo();
+  return await getParallelsInfo();
 });
 
-ipcMain.handle("scan", async () => {
-  scanCache = scanSystem();
+ipcMain.handle("scan", async (event) => {
+  scanCache = await scanSystem((scanned, total, currentName) => {
+    event.sender.send("scan-progress", scanned, total, currentName);
+  });
   return scanCache;
 });
 
 ipcMain.handle("clean", async (_event, ids: string[]) => {
   const result = cleanPaths(ids, scanCache);
-  // refresh cache after cleaning
-  scanCache = scanSystem();
+  scanCache = await scanSystem();
   return result;
 });
 
@@ -71,7 +77,6 @@ ipcMain.handle("get-stats", async () => {
   const totalMem = os.totalmem();
   const freeMem = os.freemem();
 
-  // simple cpu idle estimate
   let idle = 0;
   let total = 0;
   for (const cpu of cpus) {
@@ -80,17 +85,14 @@ ipcMain.handle("get-stats", async () => {
   }
   const cpuPercent = Math.round((1 - idle / total) * 100);
 
-  // disk usage via df on mac/linux, wmic on windows
   let diskUsedGb = 0;
   let diskTotalGb = 0;
+  let diskError: string | undefined;
   try {
     if (process.platform === "win32") {
-      const { execSync } = await import("child_process");
-      const out = execSync('wmic logicaldisk get size,freespace,caption /format:csv')
-        .toString()
-        .trim()
-        .split("\n");
-      for (const line of out) {
+      const { stdout } = await execAsync("wmic logicaldisk get size,freespace,caption /format:csv");
+      let found = false;
+      for (const line of stdout.trim().split("\n")) {
         const parts = line.split(",");
         if (parts.length >= 4 && parts[1] === "C:") {
           const free = parseFloat(parts[2]);
@@ -98,19 +100,23 @@ ipcMain.handle("get-stats", async () => {
           if (!isNaN(free) && !isNaN(size) && size > 0) {
             diskTotalGb = size / 1e9;
             diskUsedGb = (size - free) / 1e9;
+            found = true;
           }
         }
       }
+      if (!found) {
+        diskError = "Could not read disk info — try running as administrator";
+      }
     } else {
-      const { execSync } = await import("child_process");
-      const out = execSync("df -k /").toString().split("\n")[1].trim().split(/\s+/);
+      const { stdout } = await execAsync("df -k /");
+      const out = stdout.split("\n")[1].trim().split(/\s+/);
       diskTotalGb = (parseInt(out[1]) * 1024) / 1e9;
       diskUsedGb = (parseInt(out[2]) * 1024) / 1e9;
     }
-  } catch {
-    // fallback
-    diskTotalGb = 500;
-    diskUsedGb = 250;
+  } catch (err) {
+    diskError = process.platform === "win32"
+      ? "Could not read disk info — wmic may be restricted by Group Policy. Try running as administrator."
+      : `Could not read disk info: ${String(err)}`;
   }
 
   return {
@@ -120,6 +126,7 @@ ipcMain.handle("get-stats", async () => {
     ramTotalGb: totalMem / 1e9,
     diskUsedGb,
     diskTotalGb,
+    diskError,
   };
 });
 
@@ -127,17 +134,21 @@ ipcMain.handle("open-path", async (_event, p: string) => {
   if (fs.existsSync(p)) shell.showItemInFolder(p);
 });
 
-ipcMain.handle("scan-apps", async () => {
-  appCache = scanApps();
+ipcMain.handle("scan-apps", async (event) => {
+  appCache = await scanApps((scanned, total, currentName) => {
+    event.sender.send("scan-apps-progress", scanned, total, currentName);
+  });
   return appCache;
 });
 
 ipcMain.handle("disk-health", async () => {
-  return getDiskHealth();
+  return await getDiskHealth();
 });
 
-ipcMain.handle("verify-disk", async () => {
-  return verifyDiskVolume();
+ipcMain.handle("verify-disk", async (event) => {
+  return await verifyDiskVolume((line) => {
+    event.sender.send("verify-disk-progress", line);
+  });
 });
 
 ipcMain.handle("fix-symlinks", async (_event, paths: string[]) => {
@@ -156,8 +167,10 @@ ipcMain.handle("fix-symlinks", async (_event, paths: string[]) => {
   return { fixed, errors };
 });
 
-ipcMain.handle("virus-scan", async () => {
-  return virusScan();
+ipcMain.handle("virus-scan", async (event) => {
+  return await virusScan((msg, scanned) => {
+    event.sender.send("virus-scan-progress", msg, scanned);
+  });
 });
 
 ipcMain.handle("quarantine-threat", async (_event, threatPath: string) => {
@@ -172,16 +185,45 @@ ipcMain.handle("quarantine-threat", async (_event, threatPath: string) => {
   }
 });
 
+ipcMain.handle("scan-duplicates", async (event) => {
+  return await findDuplicates((scanned, total, phase) => {
+    event.sender.send("scan-duplicates-progress", scanned, total, phase);
+  });
+});
+
+ipcMain.handle("delete-duplicates", async (_event, paths: string[]) => {
+  return deleteDuplicateFiles(paths);
+});
+
 ipcMain.handle("uninstall-app", async (_event, appPath: string, associatedPaths: string[]) => {
   const errors: string[] = [];
   let freedMb = 0;
   for (const p of [appPath, ...associatedPaths]) {
     try {
       if (!fs.existsSync(p)) continue;
-      freedMb += getSizeOf(p);
+      freedMb += await getSizeOf(p);
       await shell.trashItem(p);
     } catch (e) {
       errors.push(`Could not trash ${path.basename(p)}: ${String(e)}`);
+    }
+  }
+  return { freedMb, errors };
+});
+
+ipcMain.handle("scan-usb-drive", async (_event, volPath: string) => {
+  return await scanUsbDrive(volPath);
+});
+
+ipcMain.handle("clean-usb-junk", async (_event, paths: string[]) => {
+  const errors: string[] = [];
+  let freedMb = 0;
+  for (const p of paths) {
+    try {
+      if (!fs.existsSync(p)) continue;
+      freedMb += await getSizeOf(p);
+      await shell.trashItem(p);
+    } catch (e) {
+      errors.push(`${path.basename(p)}: ${String(e)}`);
     }
   }
   return { freedMb, errors };

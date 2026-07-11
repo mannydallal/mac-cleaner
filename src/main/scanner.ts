@@ -1026,6 +1026,63 @@ export async function getSizeOf(p: string): Promise<number> {
   try { return (await getFolderSize(p)).sizeMb; } catch { return 0; }
 }
 
+// ── USB / External drive deep scan ────────────────────────────────────────────
+
+export type UsbDriveFolder = { name: string; path: string; sizeMb: number };
+export type UsbDriveJunk   = { name: string; path: string; sizeMb: number; safe: boolean };
+export type UsbDriveScanResult = {
+  topFolders: UsbDriveFolder[];
+  junkItems: UsbDriveJunk[];
+  totalJunkMb: number;
+};
+
+export async function scanUsbDrive(volPath: string): Promise<UsbDriveScanResult> {
+  const topFolders: UsbDriveFolder[] = [];
+  const junkItems:  UsbDriveJunk[]   = [];
+
+  // ── Top-level visible folders: size breakdown ──────────────────────────────
+  try {
+    const entries = await fs.promises.readdir(volPath, { withFileTypes: true });
+
+    const visibleDirs = entries.filter(e => !e.name.startsWith(".") && e.isDirectory());
+    for (const e of visibleDirs) {
+      const p = path.join(volPath, e.name);
+      const sizeMb = process.platform === "darwin"
+        ? await getDuSizeMb(p)
+        : await getWinDirSizeMb(p);
+      if (sizeMb > 0.1) topFolders.push({ name: e.name, path: p, sizeMb });
+    }
+
+    // Loose files sitting at the drive root
+    let looseFilesMb = 0;
+    for (const e of entries.filter(f => !f.name.startsWith(".") && f.isFile())) {
+      try { looseFilesMb += (await fs.promises.stat(path.join(volPath, e.name))).size / (1024 * 1024); } catch { /* skip */ }
+    }
+    if (looseFilesMb > 0.01) {
+      topFolders.push({ name: "📄 Loose files at root", path: volPath, sizeMb: looseFilesMb });
+    }
+
+    topFolders.sort((a, b) => b.sizeMb - a.sizeMb);
+  } catch { /* volume not readable */ }
+
+  // ── Hidden junk files ──────────────────────────────────────────────────────
+  const patterns = process.platform === "win32" ? WINDOWS_EXTERNAL_JUNK : EXTERNAL_JUNK_PATTERNS;
+  for (const pattern of patterns) {
+    const junkPath = path.join(volPath, pattern.relPath);
+    try {
+      if (!fs.existsSync(junkPath)) continue;
+      const sizeMb = process.platform === "darwin"
+        ? await getDuSizeMb(junkPath)
+        : await getWinDirSizeMb(junkPath);
+      if (sizeMb < 0.001) continue;
+      junkItems.push({ name: pattern.name, path: junkPath, sizeMb, safe: pattern.safe });
+    } catch { /* skip */ }
+  }
+
+  const totalJunkMb = junkItems.reduce((s, i) => s + i.sizeMb, 0);
+  return { topFolders, junkItems, totalJunkMb };
+}
+
 // ── Disk health ───────────────────────────────────────────────────────────────
 
 export type DiskHealth = {

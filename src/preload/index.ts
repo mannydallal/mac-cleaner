@@ -64,6 +64,33 @@ export type ExternalVolume = {
   freeGb: number;
 };
 
+export type UsbDriveFolder = { name: string; path: string; sizeMb: number };
+export type UsbDriveJunk   = { name: string; path: string; sizeMb: number; safe: boolean };
+export type UsbDriveScanResult = {
+  topFolders: UsbDriveFolder[];
+  junkItems: UsbDriveJunk[];
+  totalJunkMb: number;
+};
+
+export type DuplicateFile = {
+  path: string;
+  name: string;
+  sizeMb: number;
+  modifiedAt: string;
+};
+
+export type DuplicateGroup = {
+  hash: string;
+  sizeMb: number;
+  files: DuplicateFile[];
+};
+
+export type DuplicateScanResult = {
+  groups: DuplicateGroup[];
+  totalWasteMb: number;
+  scannedCount: number;
+};
+
 contextBridge.exposeInMainWorld("cleaner", {
   platform: process.platform,
   checkPermission: (): Promise<boolean> => ipcRenderer.invoke("check-permission"),
@@ -83,5 +110,40 @@ contextBridge.exposeInMainWorld("cleaner", {
   virusScan: (): Promise<VirusScanResult> => ipcRenderer.invoke("virus-scan"),
   quarantineThreat: (threatPath: string): Promise<{ ok: boolean; error?: string }> =>
     ipcRenderer.invoke("quarantine-threat", threatPath),
-  listExternalVolumes: (): Promise<ExternalVolume[]> => ipcRenderer.invoke("list-external-volumes"),
+  listExternalVolumes: (): Promise<{ volumes: ExternalVolume[]; error?: string }> => ipcRenderer.invoke("list-external-volumes"),
+  scanUsbDrive: (volPath: string): Promise<UsbDriveScanResult> => ipcRenderer.invoke("scan-usb-drive", volPath),
+  cleanUsbJunk: (paths: string[]): Promise<{ freedMb: number; errors: string[] }> => ipcRenderer.invoke("clean-usb-junk", paths),
+  scanDuplicates: (): Promise<DuplicateScanResult> => ipcRenderer.invoke("scan-duplicates"),
+  deleteDuplicates: (paths: string[]): Promise<{ freedMb: number; errors: string[] }> =>
+    ipcRenderer.invoke("delete-duplicates", paths),
+
+  // ── Progress event listeners ────────────────────────────────────────────────
+  onScanProgress: (cb: (scanned: number, total: number, currentName: string) => void) => {
+    const handler = (_e: Electron.IpcRendererEvent, scanned: number, total: number, currentName: string) =>
+      cb(scanned, total, currentName);
+    ipcRenderer.on("scan-progress", handler);
+    return () => ipcRenderer.off("scan-progress", handler);
+  },
+  onVerifyDiskProgress: (cb: (line: string) => void) => {
+    const handler = (_e: Electron.IpcRendererEvent, line: string) => cb(line);
+    ipcRenderer.on("verify-disk-progress", handler);
+    return () => ipcRenderer.off("verify-disk-progress", handler);
+  },
+  onVirusScanProgress: (cb: (msg: string, scanned: number) => void) => {
+    const handler = (_e: Electron.IpcRendererEvent, msg: string, scanned: number) => cb(msg, scanned);
+    ipcRenderer.on("virus-scan-progress", handler);
+    return () => ipcRenderer.off("virus-scan-progress", handler);
+  },
+  onScanDuplicatesProgress: (cb: (scanned: number, total: number, phase: "walk" | "hash") => void) => {
+    const handler = (_e: Electron.IpcRendererEvent, scanned: number, total: number, phase: "walk" | "hash") =>
+      cb(scanned, total, phase);
+    ipcRenderer.on("scan-duplicates-progress", handler);
+    return () => ipcRenderer.off("scan-duplicates-progress", handler);
+  },
+  onScanAppsProgress: (cb: (scanned: number, total: number, currentName: string) => void) => {
+    const handler = (_e: Electron.IpcRendererEvent, scanned: number, total: number, currentName: string) =>
+      cb(scanned, total, currentName);
+    ipcRenderer.on("scan-apps-progress", handler);
+    return () => ipcRenderer.off("scan-apps-progress", handler);
+  },
 });
