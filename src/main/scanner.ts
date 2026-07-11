@@ -1,6 +1,10 @@
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
+import * as crypto from "crypto";
+import { promisify } from "util";
+import { exec, spawn } from "child_process";
+const execAsync = promisify(exec);
 
 export type ScanResult = {
   id: string;
@@ -20,20 +24,21 @@ function expandPath(p: string): string {
   return p;
 }
 
-function getFolderSize(dirPath: string): { sizeMb: number; fileCount: number } {
+async function getFolderSize(dirPath: string): Promise<{ sizeMb: number; fileCount: number }> {
   let totalBytes = 0;
   let fileCount = 0;
   try {
-    const entries = fs.readdirSync(dirPath, { withFileTypes: true });
+    const entries = await fs.promises.readdir(dirPath, { withFileTypes: true });
     for (const entry of entries) {
       const fullPath = path.join(dirPath, entry.name);
       try {
         if (entry.isSymbolicLink()) continue;
         if (entry.isFile()) {
-          totalBytes += fs.statSync(fullPath).size;
+          const stat = await fs.promises.stat(fullPath);
+          totalBytes += stat.size;
           fileCount++;
         } else if (entry.isDirectory()) {
-          const sub = getFolderSize(fullPath);
+          const sub = await getFolderSize(fullPath);
           totalBytes += sub.sizeMb * 1024 * 1024;
           fileCount += sub.fileCount;
         }
@@ -489,6 +494,22 @@ const SCAN_TARGETS: ScanTarget[] = [
     platforms: ["darwin"],
   },
   {
+    id: "mac-parallels-public",
+    name: "Parallels VMs (Public/Share)",
+    category: "Parallels",
+    rawPath: "~/Public/Share/Parallels",
+    safe: false,
+    platforms: ["darwin"],
+  },
+  {
+    id: "mac-parallels-docs",
+    name: "Parallels VMs (Documents)",
+    category: "Parallels",
+    rawPath: "~/Documents/Parallels",
+    safe: false,
+    platforms: ["darwin"],
+  },
+  {
     id: "mac-parallels-cache",
     name: "Parallels Cache",
     category: "Parallels",
@@ -646,13 +667,17 @@ export type ExternalVolume = {
   freeGb: number;
 };
 
-export function listMountedVolumes(): ExternalVolume[] {
+export type MountedVolumesResult = {
+  volumes: ExternalVolume[];
+  error?: string;
+};
+
+export async function listMountedVolumes(): Promise<MountedVolumesResult> {
   const results: ExternalVolume[] = [];
-  const { execSync } = require("child_process") as typeof import("child_process");
 
   if (process.platform === "darwin") {
     try {
-      const volumes = fs.readdirSync("/Volumes", { withFileTypes: true });
+      const volumes = await fs.promises.readdir("/Volumes", { withFileTypes: true });
       for (const vol of volumes) {
         const volPath = path.join("/Volumes", vol.name);
         try {
@@ -660,8 +685,8 @@ export function listMountedVolumes(): ExternalVolume[] {
           if (resolved === "/") continue;
         } catch { continue; }
         try {
-          const out = execSync(`df -k "${volPath}" 2>/dev/null | tail -1`, { encoding: "utf8" }).trim();
-          const parts = out.split(/\s+/);
+          const { stdout } = await execAsync(`df -k "${volPath}" 2>/dev/null | tail -1`);
+          const parts = stdout.trim().split(/\s+/);
           const totalKb = parseInt(parts[1] ?? "0", 10);
           const freeKb  = parseInt(parts[3] ?? "0", 10);
           results.push({ name: vol.name, path: volPath, totalGb: totalKb / 1024 / 1024, freeGb: freeKb / 1024 / 1024 });
@@ -670,11 +695,12 @@ export function listMountedVolumes(): ExternalVolume[] {
         }
       }
     } catch { /* /Volumes not accessible */ }
+    return { volumes: results };
   } else if (process.platform === "win32") {
     try {
       // wmic logicaldisk: DriveType 2=Removable, 3=Fixed (skip C:)
-      const out = execSync("wmic logicaldisk get DeviceID,DriveType,Size,FreeSpace /format:csv", { encoding: "utf8" });
-      for (const line of out.split("\n")) {
+      const { stdout } = await execAsync("wmic logicaldisk get DeviceID,DriveType,Size,FreeSpace /format:csv");
+      for (const line of stdout.split("\n")) {
         const cols = line.trim().split(",");
         if (cols.length < 5) continue;
         const [, deviceId, driveType, freeSpace, size] = cols;
@@ -686,9 +712,15 @@ export function listMountedVolumes(): ExternalVolume[] {
         const freeGb  = parseInt(freeSpace ?? "0", 10) / 1024 / 1024 / 1024;
         results.push({ name: deviceId, path: deviceId + "\\", totalGb, freeGb });
       }
-    } catch { /* wmic unavailable */ }
+      return { volumes: results };
+    } catch {
+      return {
+        volumes: [],
+        error: "Could not detect drives — wmic may be restricted by Group Policy. Try running as administrator.",
+      };
+    }
   }
-  return results;
+  return { volumes: results };
 }
 
 const WINDOWS_EXTERNAL_JUNK: { name: string; relPath: string; safe: boolean }[] = [
@@ -698,16 +730,16 @@ const WINDOWS_EXTERNAL_JUNK: { name: string; relPath: string; safe: boolean }[] 
   { name: "Temporary Items",        relPath: "FOUND.000",                safe: true },
 ];
 
-export function scanExternalDrives(): ScanResult[] {
+export async function scanExternalDrives(): Promise<ScanResult[]> {
   const results: ScanResult[] = [];
 
   if (process.platform === "win32") {
-    const volumes = listMountedVolumes();
+    const { volumes } = await listMountedVolumes();
     for (const vol of volumes) {
       for (const pattern of WINDOWS_EXTERNAL_JUNK) {
         const junkPath = path.join(vol.path, pattern.relPath);
         if (!fs.existsSync(junkPath)) continue;
-        const { sizeMb, fileCount } = getFolderSize(junkPath);
+        const { sizeMb, fileCount } = await getFolderSize(junkPath);
         if (sizeMb < 0.001) continue;
         results.push({
           id: `ext-${vol.name}-${pattern.relPath}`,
@@ -726,7 +758,7 @@ export function scanExternalDrives(): ScanResult[] {
   if (process.platform !== "darwin") return [];
 
   try {
-    const volumes = fs.readdirSync("/Volumes", { withFileTypes: true });
+    const volumes = await fs.promises.readdir("/Volumes", { withFileTypes: true });
     for (const vol of volumes) {
       const volPath = path.join("/Volumes", vol.name);
       try {
@@ -738,7 +770,7 @@ export function scanExternalDrives(): ScanResult[] {
       for (const pattern of EXTERNAL_JUNK_PATTERNS) {
         const junkPath = path.join(volPath, pattern.relPath);
         if (!fs.existsSync(junkPath)) continue;
-        const { sizeMb, fileCount } = getFolderSize(junkPath);
+        const { sizeMb, fileCount } = await getFolderSize(junkPath);
         if (sizeMb < 0.001) continue;
         results.push({
           id: `ext-${vol.name}-${pattern.relPath}`,
@@ -756,15 +788,21 @@ export function scanExternalDrives(): ScanResult[] {
   return results.sort((a, b) => b.sizeMb - a.sizeMb);
 }
 
-export function scanSystem(): ScanResult[] {
+export async function scanSystem(
+  onProgress?: (scanned: number, total: number, currentName: string) => void
+): Promise<ScanResult[]> {
   const platform = process.platform as "darwin" | "win32" | "linux";
   const results: ScanResult[] = [];
 
-  for (const target of SCAN_TARGETS) {
-    if (!target.platforms.includes(platform)) continue;
+  const targets = SCAN_TARGETS.filter((t) => t.platforms.includes(platform));
+  const total = targets.length;
+
+  for (let i = 0; i < targets.length; i++) {
+    const target = targets[i];
+    onProgress?.(i, total, target.name);
     const expanded = expandPath(target.rawPath);
     if (!fs.existsSync(expanded)) continue;
-    const { sizeMb, fileCount } = getFolderSize(expanded);
+    const { sizeMb, fileCount } = await getFolderSize(expanded);
     if (sizeMb < 0.001) continue;
     results.push({
       id: target.id,
@@ -776,9 +814,10 @@ export function scanSystem(): ScanResult[] {
       safe: target.safe,
     });
   }
+  onProgress?.(total, total, "External drives");
 
   // Include external drive junk in the full scan
-  results.push(...scanExternalDrives());
+  results.push(...await scanExternalDrives());
 
   return results.sort((a, b) => b.sizeMb - a.sizeMb);
 }
@@ -792,14 +831,14 @@ export type ParallelsInfo = {
   totalVmSizeMb: number;
 };
 
-export function getParallelsInfo(): ParallelsInfo {
+export async function getParallelsInfo(): Promise<ParallelsInfo> {
   const home = os.homedir();
   const appPath = "/Applications/Parallels Desktop.app/Contents/Info.plist";
   let version = "";
 
   if (fs.existsSync(appPath)) {
     try {
-      const plist = fs.readFileSync(appPath, "utf-8");
+      const plist = await fs.promises.readFile(appPath, "utf-8");
       const short = plist.match(/<key>CFBundleShortVersionString<\/key>\s*<string>([^<]+)<\/string>/);
       const bundle = plist.match(/<key>CFBundleVersion<\/key>\s*<string>([^<]+)<\/string>/);
       if (short) version = short[1].trim();
@@ -807,16 +846,24 @@ export function getParallelsInfo(): ParallelsInfo {
     } catch { /* skip */ }
   }
 
-  const vmsDir = path.join(home, "Parallels");
+  const vmsDirs = [
+    path.join(home, "Parallels"),
+    path.join(home, "Public", "Share", "Parallels"),
+    path.join(home, "Documents", "Parallels"),
+  ];
   const vms: { name: string; sizeMb: number }[] = [];
+  const seenNames = new Set<string>();
 
-  if (fs.existsSync(vmsDir)) {
+  for (const vmsDir of vmsDirs) {
+    if (!fs.existsSync(vmsDir)) continue;
     try {
-      const entries = fs.readdirSync(vmsDir, { withFileTypes: true });
+      const entries = await fs.promises.readdir(vmsDir, { withFileTypes: true });
       for (const entry of entries) {
         if (!entry.name.endsWith(".pvm")) continue;
+        if (seenNames.has(entry.name)) continue;
+        seenNames.add(entry.name);
         const vmPath = path.join(vmsDir, entry.name);
-        const { sizeMb } = getFolderSize(vmPath);
+        const { sizeMb } = await getFolderSize(vmPath);
         vms.push({ name: entry.name.replace(/\.pvm$/, ""), sizeMb });
       }
     } catch { /* skip */ }
@@ -840,10 +887,10 @@ export type AppInfo = {
   associatedSizeMb: number;
 };
 
-function getAppBundleId(appPath: string): string {
+async function getAppBundleId(appPath: string): Promise<string> {
   try {
     const plistPath = path.join(appPath, "Contents", "Info.plist");
-    const content = fs.readFileSync(plistPath, "utf-8");
+    const content = await fs.promises.readFile(plistPath, "utf-8");
     const match = content.match(/<key>CFBundleIdentifier<\/key>\s*<string>([^<]+)<\/string>/);
     return match?.[1] ?? "";
   } catch {
@@ -851,7 +898,7 @@ function getAppBundleId(appPath: string): string {
   }
 }
 
-function findAssociatedPaths(cleanName: string, bundleId: string): string[] {
+async function findAssociatedPaths(cleanName: string, bundleId: string): Promise<string[]> {
   const home = os.homedir();
   const found: string[] = [];
 
@@ -872,7 +919,7 @@ function findAssociatedPaths(cleanName: string, bundleId: string): string[] {
   // Scan Preferences for matching plists
   const prefsDir = path.join(home, "Library", "Preferences");
   try {
-    const prefs = fs.readdirSync(prefsDir).filter(
+    const prefs = (await fs.promises.readdir(prefsDir)).filter(
       (f) => (bundleId && f.startsWith(bundleId)) || f.toLowerCase().startsWith(cleanName.toLowerCase())
     );
     prefs.forEach((f) => candidates.push(path.join(prefsDir, f)));
@@ -887,50 +934,96 @@ function findAssociatedPaths(cleanName: string, bundleId: string): string[] {
   return found;
 }
 
-export function scanApps(): AppInfo[] {
+async function getDuSizeMb(targetPath: string): Promise<number> {
+  try {
+    const { stdout } = await execAsync(`du -sk "${targetPath}" 2>/dev/null`);
+    const kb = parseInt(stdout.trim().split(/\s+/)[0] ?? "0", 10);
+    return isNaN(kb) ? 0 : kb / 1024;
+  } catch {
+    return 0;
+  }
+}
+
+async function getWinDirSizeMb(targetPath: string): Promise<number> {
+  try {
+    const { stdout } = await execAsync(
+      `powershell -NoProfile -Command "(Get-ChildItem -Path '${targetPath}' -Recurse -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum"`,
+    );
+    const bytes = parseInt(stdout.trim(), 10);
+    return isNaN(bytes) ? 0 : bytes / (1024 * 1024);
+  } catch {
+    return 0;
+  }
+}
+
+export async function scanApps(
+  onProgress?: (scanned: number, total: number, currentName: string) => void,
+): Promise<AppInfo[]> {
   const results: AppInfo[] = [];
 
   if (process.platform === "darwin") {
-    const appsDir = "/Applications";
-    try {
-      const entries = fs.readdirSync(appsDir, { withFileTypes: true });
-      for (const entry of entries) {
-        if (!entry.name.endsWith(".app")) continue;
-        const appPath = path.join(appsDir, entry.name);
-        const cleanName = entry.name.replace(/\.app$/, "");
-        const bundleId = getAppBundleId(appPath);
-        const { sizeMb } = getFolderSize(appPath);
-        const associatedPaths = findAssociatedPaths(cleanName, bundleId);
-        const associatedSizeMb = associatedPaths.reduce((sum, p) => {
-          try { return sum + getFolderSize(p).sizeMb; } catch { return sum; }
-        }, 0);
-        results.push({ name: cleanName, appPath, bundleId, sizeMb, associatedPaths, associatedSizeMb });
+    // Collect .app entries from both /Applications and ~/Applications
+    const appsDirs = ["/Applications", path.join(os.homedir(), "Applications")];
+    const allEntries: { name: string; appPath: string }[] = [];
+    for (const appsDir of appsDirs) {
+      try {
+        const entries = (await fs.promises.readdir(appsDir, { withFileTypes: true }))
+          .filter(e => e.name.endsWith(".app"));
+        for (const e of entries) {
+          allEntries.push({ name: e.name, appPath: path.join(appsDir, e.name) });
+        }
+      } catch { /* dir doesn't exist or inaccessible */ }
+    }
+
+    const total = allEntries.length;
+    let scanned = 0;
+    for (const { name, appPath } of allEntries) {
+      const cleanName = name.replace(/\.app$/, "");
+      onProgress?.(scanned, total, cleanName);
+      const bundleId = await getAppBundleId(appPath);
+      // Use du -sk — 50-100x faster than recursive JS walk for large app bundles
+      const sizeMb = await getDuSizeMb(appPath);
+      const associatedPaths = await findAssociatedPaths(cleanName, bundleId);
+      let associatedSizeMb = 0;
+      for (const p of associatedPaths) {
+        associatedSizeMb += await getDuSizeMb(p);
       }
-    } catch { /* skip */ }
+      results.push({ name: cleanName, appPath, bundleId, sizeMb, associatedPaths, associatedSizeMb });
+      scanned++;
+      onProgress?.(scanned, total, cleanName);
+    }
   } else if (process.platform === "win32") {
     const dirs = [
       "C:\\Program Files",
       "C:\\Program Files (x86)",
       path.join(os.homedir(), "AppData", "Local", "Programs"),
     ];
+    const allEntries: { name: string; appPath: string }[] = [];
     for (const dir of dirs) {
       try {
-        const entries = fs.readdirSync(dir, { withFileTypes: true });
+        const entries = await fs.promises.readdir(dir, { withFileTypes: true });
         for (const entry of entries) {
           if (!entry.isDirectory()) continue;
-          const appPath = path.join(dir, entry.name);
-          const { sizeMb } = getFolderSize(appPath);
-          results.push({ name: entry.name, appPath, bundleId: "", sizeMb, associatedPaths: [], associatedSizeMb: 0 });
+          allEntries.push({ name: entry.name, appPath: path.join(dir, entry.name) });
         }
       } catch { /* skip */ }
+    }
+    const total = allEntries.length;
+    let scanned = 0;
+    for (const { name, appPath } of allEntries) {
+      onProgress?.(scanned, total, name);
+      const sizeMb = await getWinDirSizeMb(appPath);
+      results.push({ name, appPath, bundleId: "", sizeMb, associatedPaths: [], associatedSizeMb: 0 });
+      scanned++;
+      onProgress?.(scanned, total, name);
     }
   }
 
   return results.sort((a, b) => (b.sizeMb + b.associatedSizeMb) - (a.sizeMb + a.associatedSizeMb));
 }
 
-export function getSizeOf(p: string): number {
-  try { return getFolderSize(p).sizeMb; } catch { return 0; }
+export async function getSizeOf(p: string): Promise<number> {
+  try { return (await getFolderSize(p)).sizeMb; } catch { return 0; }
 }
 
 // ── Disk health ───────────────────────────────────────────────────────────────
@@ -942,6 +1035,7 @@ export type DiskHealth = {
   totalGb: number;
   freeGb: number;
   brokenSymlinks: string[];
+  error?: string;
 };
 
 function findBrokenSymlinks(dir: string, maxDepth = 3, maxFound = 100): string[] {
@@ -969,56 +1063,76 @@ function findBrokenSymlinks(dir: string, maxDepth = 3, maxFound = 100): string[]
   return found;
 }
 
-export function getDiskHealth(): DiskHealth {
+export async function getDiskHealth(): Promise<DiskHealth> {
   let smartStatus = "Unknown";
   let volumeName = "";
   let fileSystem = "";
   let totalGb = 0;
   let freeGb = 0;
-  const { execSync } = require("child_process") as typeof import("child_process");
 
   if (process.platform === "darwin") {
     // ── Mac: diskutil ──────────────────────────────────────────
     try {
-      const out = execSync("diskutil info /", { encoding: "utf-8", timeout: 8000 }) as string;
-      const smart  = out.match(/S\.M\.A\.R\.T\. Status:\s*(.+)/);
-      const vol    = out.match(/Volume Name:\s*(.+)/);
-      const fsLine = out.match(/Type \(Bundle\):\s*(.+)/);
+      const { stdout } = await execAsync("diskutil info /", { timeout: 8000 });
+      const smart  = stdout.match(/S\.M\.A\.R\.T\. Status:\s*(.+)/);
+      const vol    = stdout.match(/Volume Name:\s*(.+)/);
+      const fsLine = stdout.match(/Type \(Bundle\):\s*(.+)/);
       if (smart)  smartStatus = smart[1].trim();
       if (vol)    volumeName  = vol[1].trim();
       if (fsLine) fileSystem  = fsLine[1].trim();
     } catch { /* skip */ }
 
     try {
-      const df = (execSync("df -k /", { encoding: "utf-8" }) as string).split("\n")[1].trim().split(/\s+/);
+      const { stdout } = await execAsync("df -k /");
+      const df = stdout.split("\n")[1].trim().split(/\s+/);
       totalGb = (parseInt(df[1]) * 1024) / 1e9;
       freeGb  = (parseInt(df[3]) * 1024) / 1e9;
     } catch { /* skip */ }
 
   } else if (process.platform === "win32") {
     // ── Windows: wmic ──────────────────────────────────────────
+    let wmicSmartFailed = false;
+    let wmicVolumeFailed = false;
+
     // SMART status
     try {
-      const out = execSync("wmic diskdrive get status /value", { encoding: "utf-8", timeout: 10000 }) as string;
-      const match = out.match(/Status=(\w+)/i);
+      const { stdout } = await execAsync("wmic diskdrive get status /value", { timeout: 10000 });
+      const match = stdout.match(/Status=(\w+)/i);
       smartStatus = match ? (match[1] === "OK" ? "Verified" : match[1]) : "Unknown";
-    } catch { /* skip */ }
+    } catch {
+      wmicSmartFailed = true;
+    }
 
     // Volume info for C:
     try {
-      const out = execSync(
+      const { stdout } = await execAsync(
         'wmic logicaldisk where DeviceID="C:" get Size,FreeSpace,FileSystem,VolumeName /value',
-        { encoding: "utf-8", timeout: 10000 }
-      ) as string;
-      const fsMatch   = out.match(/FileSystem=(\w+)/i);
-      const freeMatch = out.match(/FreeSpace=(\d+)/i);
-      const sizeMatch = out.match(/Size=(\d+)/i);
-      const nameMatch = out.match(/VolumeName=([^\r\n]+)/i);
+        { timeout: 10000 }
+      );
+      const fsMatch   = stdout.match(/FileSystem=(\w+)/i);
+      const freeMatch = stdout.match(/FreeSpace=(\d+)/i);
+      const sizeMatch = stdout.match(/Size=(\d+)/i);
+      const nameMatch = stdout.match(/VolumeName=([^\r\n]+)/i);
       if (fsMatch)   fileSystem = fsMatch[1];
       volumeName  = nameMatch?.[1]?.trim() || "Local Disk (C:)";
       if (sizeMatch) totalGb = parseInt(sizeMatch[1]) / 1e9;
       if (freeMatch) freeGb  = parseInt(freeMatch[1]) / 1e9;
-    } catch { /* skip */ }
+      if (!sizeMatch && !freeMatch) wmicVolumeFailed = true;
+    } catch {
+      wmicVolumeFailed = true;
+    }
+
+    if (wmicSmartFailed && wmicVolumeFailed) {
+      return {
+        smartStatus: "Unknown",
+        volumeName: "Local Disk (C:)",
+        fileSystem: "Unknown",
+        totalGb: 0,
+        freeGb: 0,
+        brokenSymlinks: [],
+        error: "Could not read disk info — wmic may be restricted by Group Policy. Try running as administrator.",
+      };
+    }
   }
 
   // ── Broken symlinks (cross-platform) ───────────────────────
@@ -1046,29 +1160,54 @@ export function getDiskHealth(): DiskHealth {
   return { smartStatus, volumeName: volumeName || "System Drive", fileSystem: fileSystem || "Unknown", totalGb, freeGb, brokenSymlinks };
 }
 
-export function verifyDiskVolume(): string {
-  const { execSync } = require("child_process") as typeof import("child_process");
+export function verifyDiskVolume(onProgress?: (line: string) => void): Promise<string> {
+  return new Promise((resolve) => {
+    let cmd: string;
+    let args: string[];
 
-  if (process.platform === "darwin") {
-    try {
-      return execSync("diskutil verifyVolume /", { encoding: "utf-8", timeout: 120000 }) as string;
-    } catch (e: unknown) {
-      const err = e as { stdout?: string; message?: string };
-      return err.stdout ?? err.message ?? String(e);
+    if (process.platform === "darwin") {
+      cmd = "diskutil";
+      args = ["verifyVolume", "/"];
+    } else if (process.platform === "win32") {
+      // chkdsk C: with no flags = read-only check, no admin required
+      cmd = "chkdsk";
+      args = ["C:"];
+    } else {
+      resolve("Disk verification is not supported on this platform.");
+      return;
     }
 
-  } else if (process.platform === "win32") {
-    // chkdsk C: with no flags = read-only check, no admin required
-    try {
-      return execSync("chkdsk C:", { encoding: "utf-8", timeout: 120000 }) as string;
-    } catch (e: unknown) {
-      // chkdsk exits non-zero when it finds issues but still prints the report
-      const err = e as { stdout?: string; stderr?: string; message?: string };
-      return err.stdout || err.stderr || err.message || String(e);
-    }
-  }
+    const child = spawn(cmd, args);
+    const chunks: string[] = [];
 
-  return "Disk verification is not supported on this platform.";
+    const handleData = (data: Buffer) => {
+      const text = data.toString();
+      chunks.push(text);
+      if (onProgress) {
+        for (const line of text.split(/\r?\n/).filter(Boolean)) {
+          onProgress(line);
+        }
+      }
+    };
+
+    child.stdout.on("data", handleData);
+    child.stderr.on("data", handleData);
+
+    const timer = setTimeout(() => {
+      child.kill();
+      resolve(chunks.join("") || "Disk verification timed out.");
+    }, 120000);
+
+    child.on("close", () => {
+      clearTimeout(timer);
+      resolve(chunks.join(""));
+    });
+
+    child.on("error", (err) => {
+      clearTimeout(timer);
+      resolve(err.message);
+    });
+  });
 }
 
 // ── Virus / Malware Scanner ───────────────────────────────────────────────────
@@ -1126,18 +1265,18 @@ const WIN_THREAT_PATTERNS: { pattern: RegExp; name: string; severity: ThreatItem
   { pattern: /installcore/i,   name: "InstallCore",      severity: "medium",   desc: "Bundled adware installer" },
 ];
 
-function scanDirForThreats(
+async function scanDirForThreats(
   dir: string,
   patterns: { pattern: RegExp; name: string; severity: ThreatItem["severity"]; desc: string }[],
   depth = 1,
   maxFiles = 500,
-): { threats: ThreatItem[]; scanned: number } {
+): Promise<{ threats: ThreatItem[]; scanned: number }> {
   const threats: ThreatItem[] = [];
   let scanned = 0;
-  function walk(d: string, level: number) {
+  async function walk(d: string, level: number) {
     if (level > depth || scanned >= maxFiles) return;
     let entries: fs.Dirent[];
-    try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
+    try { entries = await fs.promises.readdir(d, { withFileTypes: true }); } catch { return; }
     for (const e of entries) {
       if (scanned >= maxFiles) break;
       const full = path.join(d, e.name);
@@ -1148,16 +1287,17 @@ function scanDirForThreats(
           break;
         }
       }
-      if (e.isDirectory() && level < depth) walk(full, level + 1);
+      if (e.isDirectory() && level < depth) await walk(full, level + 1);
     }
   }
-  walk(dir, 0);
+  await walk(dir, 0);
   return { threats, scanned };
 }
 
-export function virusScan(): VirusScanResult {
+export async function virusScan(
+  onProgress?: (msg: string, scanned: number) => void
+): Promise<VirusScanResult> {
   const start = Date.now();
-  const { execSync } = require("child_process") as typeof import("child_process");
 
   try {
     if (process.platform === "darwin") {
@@ -1167,6 +1307,7 @@ export function virusScan(): VirusScanResult {
       let totalScanned = 0;
 
       // Pass 1: persistence locations (deep)
+      onProgress?.("Checking launch agents and startup items…", totalScanned);
       const persistDirs = [
         { dir: path.join(home, "Library", "LaunchAgents"),          depth: 3 },
         { dir: "/Library/LaunchAgents",                              depth: 3 },
@@ -1177,12 +1318,13 @@ export function virusScan(): VirusScanResult {
       ];
       for (const { dir, depth } of persistDirs) {
         if (!fs.existsSync(dir)) continue;
-        const { threats, scanned } = scanDirForThreats(dir, MAC_THREAT_PATTERNS, depth, 2000);
+        const { threats, scanned } = await scanDirForThreats(dir, MAC_THREAT_PATTERNS, depth, 2000);
         allThreats.push(...threats);
         totalScanned += scanned;
       }
 
       // Pass 2: Applications + user dirs (broad)
+      onProgress?.("Scanning applications and user directories…", totalScanned);
       const broadDirs = [
         { dir: "/Applications",                                       depth: 2 },
         { dir: path.join(home, "Applications"),                      depth: 2 },
@@ -1200,12 +1342,14 @@ export function virusScan(): VirusScanResult {
       ];
       for (const { dir, depth } of broadDirs) {
         if (!fs.existsSync(dir)) continue;
-        const { threats, scanned } = scanDirForThreats(dir, MAC_THREAT_PATTERNS, depth, 2000);
+        const { threats, scanned } = await scanDirForThreats(dir, MAC_THREAT_PATTERNS, depth, 2000);
         allThreats.push(...threats);
         totalScanned += scanned;
+        onProgress?.(`Scanning ${path.basename(dir)}…`, totalScanned);
       }
 
       // Pass 3: mdfind bundle ID sweep (covers all mounted volumes)
+      onProgress?.("Running bundle ID sweep across all volumes…", totalScanned);
       const knownBundles = [
         "com.genieo", "com.vsearch", "com.pirrit", "com.babylon", "com.conduit",
         "com.searchmine", "com.weknow", "com.adload", "com.bundlore", "com.shlayer",
@@ -1213,11 +1357,12 @@ export function virusScan(): VirusScanResult {
       ];
       for (const bundleId of knownBundles) {
         try {
-          const found = execSync(
+          const { stdout } = await execAsync(
             `mdfind "kMDItemCFBundleIdentifier == '*${bundleId}*'"`,
-            { encoding: "utf-8", timeout: 8000 }
-          ) as string;
-          for (const line of found.split("\n").filter(Boolean)) {
+            { timeout: 8000 }
+          );
+          for (const line of stdout.split("\n").filter(Boolean)) {
+            totalScanned++;
             if (!allThreats.some(t => t.path === line)) {
               const match = MAC_THREAT_PATTERNS.find(p => p.pattern.test(bundleId));
               if (match) allThreats.push({ path: line, name: match.name, severity: match.severity, description: match.desc });
@@ -1227,6 +1372,7 @@ export function virusScan(): VirusScanResult {
       }
 
       // Pass 4: find unsigned / suspicious executables in common drop paths
+      onProgress?.("Checking for unsigned executables in Downloads and Desktop…", totalScanned);
       const dropPaths = [
         path.join(home, "Downloads"),
         path.join(home, "Desktop"),
@@ -1236,18 +1382,15 @@ export function virusScan(): VirusScanResult {
       for (const dp of dropPaths) {
         if (!fs.existsSync(dp)) continue;
         try {
-          // find executables that lack a valid Apple code signature
-          const out = execSync(
+          const { stdout: out } = await execAsync(
             `find "${dp}" -maxdepth 3 -type f \\( -name "*.pkg" -o -name "*.dmg" -o -name "*.app" -o -perm +111 \\) 2>/dev/null | head -200`,
-            { encoding: "utf-8", timeout: 15000 }
-          ) as string;
+            { timeout: 15000 }
+          );
           for (const fp of out.split("\n").filter(Boolean)) {
             totalScanned++;
-            // check code signature
             try {
-              execSync(`codesign --verify --strict "${fp}" 2>&1`, { timeout: 3000, stdio: "pipe" });
+              await execAsync(`codesign --verify --strict "${fp}" 2>&1`, { timeout: 3000 });
             } catch {
-              // no valid signature — check if it matches any threat pattern by name
               const base = path.basename(fp);
               for (const t of MAC_THREAT_PATTERNS) {
                 if (t.pattern.test(base) || t.pattern.test(fp)) {
@@ -1258,16 +1401,18 @@ export function virusScan(): VirusScanResult {
                 }
               }
             }
+            if (totalScanned % 50 === 0) onProgress?.(`Checking executables… (${totalScanned} scanned)`, totalScanned);
           }
         } catch { /* skip */ }
       }
 
       // Pass 5: check login items via osascript
+      onProgress?.("Checking login items…", totalScanned);
       try {
-        const items = execSync(
+        const { stdout: items } = await execAsync(
           `osascript -e 'tell application "System Events" to get the path of every login item'`,
-          { encoding: "utf-8", timeout: 8000 }
-        ) as string;
+          { timeout: 8000 }
+        );
         for (const item of items.split(", ").map(s => s.trim()).filter(Boolean)) {
           totalScanned++;
           for (const t of MAC_THREAT_PATTERNS) {
@@ -1293,20 +1438,36 @@ export function virusScan(): VirusScanResult {
       const allThreats: ThreatItem[] = [];
       let totalScanned = 0;
 
-      // 1. Run Windows Defender full scan (ScanType 2)
+      // 1. Run Windows Defender full scan (ScanType 2) — spawn so stdout streams as progress
+      onProgress?.("Starting Windows Defender scan…", totalScanned);
       try {
         const defenderPath = "C:\\Program Files\\Windows Defender\\MpCmdRun.exe";
         if (fs.existsSync(defenderPath)) {
-          execSync(`"${defenderPath}" -Scan -ScanType 2`, { timeout: 300000 });
+          await new Promise<void>((resolve) => {
+            const child = spawn(defenderPath, ["-Scan", "-ScanType", "2"]);
+            const handleData = (data: Buffer) => {
+              const line = data.toString().trim();
+              if (line) {
+                totalScanned++;
+                onProgress?.(line, totalScanned);
+              }
+            };
+            child.stdout.on("data", handleData);
+            child.stderr.on("data", handleData);
+            const timer = setTimeout(() => { child.kill(); resolve(); }, 300000);
+            child.on("close", () => { clearTimeout(timer); resolve(); });
+            child.on("error", () => { clearTimeout(timer); resolve(); });
+          });
         }
       } catch { /* exits non-zero when threats found — ok */ }
 
       // 2. Pull all Defender detections via PowerShell
+      onProgress?.("Reading Windows Defender threat history…", totalScanned);
       try {
-        const out = execSync(
+        const { stdout: out } = await execAsync(
           `powershell -NoProfile -Command "Get-MpThreatDetection | Select-Object -Property ThreatName,Resources,SeverityID | ConvertTo-Json -Depth 3"`,
-          { encoding: "utf-8", timeout: 20000 }
-        ) as string;
+          { timeout: 20000 }
+        );
         if (out && out.trim()) {
           const parsed = JSON.parse(out.startsWith("[") ? out : `[${out}]`) as Array<{
             ThreatName?: string; Resources?: string | string[]; SeverityID?: number;
@@ -1324,6 +1485,7 @@ export function virusScan(): VirusScanResult {
       } catch { /* no detections or PS unavailable */ }
 
       // 3. Deep pattern scan across all user + system dirs
+      onProgress?.("Scanning user and system directories for known threats…", totalScanned);
       const home = os.homedir();
       const winDirs = [
         { dir: path.join(home, "AppData", "Roaming", "Microsoft", "Windows", "Start Menu", "Programs", "Startup"), depth: 2 },
@@ -1340,19 +1502,22 @@ export function virusScan(): VirusScanResult {
       ];
       for (const { dir, depth } of winDirs) {
         if (!fs.existsSync(dir)) continue;
-        const { threats, scanned } = scanDirForThreats(dir, WIN_THREAT_PATTERNS, depth, 3000);
+        onProgress?.(`Scanning ${dir}…`, totalScanned);
+        const { threats, scanned } = await scanDirForThreats(dir, WIN_THREAT_PATTERNS, depth, 3000);
         for (const t of threats) {
           if (!allThreats.some(x => x.path === t.path)) allThreats.push(t);
         }
         totalScanned += scanned;
+        onProgress?.(`Scanned ${dir}`, totalScanned);
       }
 
       // 4. Check run registry keys via PowerShell
+      onProgress?.("Checking Windows startup registry entries…", totalScanned);
       try {
-        const regOut = execSync(
+        const { stdout: regOut } = await execAsync(
           `powershell -NoProfile -Command "Get-ItemProperty 'HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run' | ConvertTo-Json -Depth 2"`,
-          { encoding: "utf-8", timeout: 10000 }
-        ) as string;
+          { timeout: 10000 }
+        );
         if (regOut && regOut.trim()) {
           const regMap = JSON.parse(regOut) as Record<string, string>;
           for (const [key, val] of Object.entries(regMap)) {
@@ -1423,5 +1588,155 @@ export function cleanPaths(
     }
   }
 
+  return { freedMb, errors };
+}
+
+// ── Duplicate Finder ──────────────────────────────────────────────────────────
+
+export type DuplicateFile = {
+  path: string;
+  name: string;
+  sizeMb: number;
+  modifiedAt: string;
+};
+
+export type DuplicateGroup = {
+  hash: string;
+  sizeMb: number;
+  files: DuplicateFile[];
+};
+
+export type DuplicateScanResult = {
+  groups: DuplicateGroup[];
+  totalWasteMb: number;
+  scannedCount: number;
+};
+
+async function hashFile(filePath: string): Promise<string | null> {
+  try {
+    const buf = await fs.promises.readFile(filePath);
+    return crypto.createHash("sha256").update(buf).digest("hex");
+  } catch {
+    return null;
+  }
+}
+
+async function walkDir(dir: string, maxDepth: number, depth = 0): Promise<string[]> {
+  if (depth > maxDepth) return [];
+  const results: string[] = [];
+  try {
+    const entries = await fs.promises.readdir(dir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (entry.name.startsWith(".")) continue;
+      const fullPath = path.join(dir, entry.name);
+      try {
+        if (entry.isSymbolicLink()) continue;
+        if (entry.isFile()) {
+          results.push(fullPath);
+        } else if (entry.isDirectory()) {
+          results.push(...await walkDir(fullPath, maxDepth, depth + 1));
+        }
+      } catch { /* skip */ }
+    }
+  } catch { /* skip */ }
+  return results;
+}
+
+export async function findDuplicates(
+  onProgress?: (scanned: number, total: number, phase: "walk" | "hash") => void
+): Promise<DuplicateScanResult> {
+  const home = os.homedir();
+  const scanDirs = [
+    path.join(home, "Desktop"),
+    path.join(home, "Documents"),
+    path.join(home, "Downloads"),
+    path.join(home, "Pictures"),
+    path.join(home, "Music"),
+    path.join(home, "Movies"),
+  ];
+
+  const allFiles: string[] = [];
+  for (const dir of scanDirs) {
+    if (fs.existsSync(dir)) allFiles.push(...await walkDir(dir, 5));
+  }
+
+  // Pre-filter: group by file size (no hashing needed for unique sizes)
+  const bySize = new Map<number, string[]>();
+  for (let i = 0; i < allFiles.length; i++) {
+    const filePath = allFiles[i];
+    try {
+      const stat = await fs.promises.stat(filePath);
+      if (stat.size < 1024) continue; // skip files < 1 KB
+      const group = bySize.get(stat.size) ?? [];
+      group.push(filePath);
+      bySize.set(stat.size, group);
+    } catch { /* skip */ }
+    if (onProgress && i % 200 === 0) onProgress(i, allFiles.length, "walk");
+  }
+  onProgress?.(allFiles.length, allFiles.length, "walk");
+
+  // Collect candidates that need hashing
+  const candidates: string[] = [];
+  for (const [, files] of bySize.entries()) {
+    if (files.length >= 2) candidates.push(...files);
+  }
+
+  // Hash only files that share a size with at least one other file
+  const byHash = new Map<string, string[]>();
+  for (let i = 0; i < candidates.length; i++) {
+    const filePath = candidates[i];
+    const hash = await hashFile(filePath);
+    if (!hash) continue;
+    const group = byHash.get(hash) ?? [];
+    group.push(filePath);
+    byHash.set(hash, group);
+    if (onProgress && i % 50 === 0) onProgress(i, candidates.length, "hash");
+  }
+  onProgress?.(candidates.length, candidates.length, "hash");
+
+  const groups: DuplicateGroup[] = [];
+  let totalWasteMb = 0;
+
+  for (const [hash, files] of byHash.entries()) {
+    if (files.length < 2) continue;
+    const fileInfos: DuplicateFile[] = await Promise.all(files.map(async filePath => {
+      try {
+        const stat = await fs.promises.stat(filePath);
+        return {
+          path: filePath,
+          name: path.basename(filePath),
+          sizeMb: stat.size / (1024 * 1024),
+          modifiedAt: stat.mtime.toISOString(),
+        };
+      } catch {
+        return { path: filePath, name: path.basename(filePath), sizeMb: 0, modifiedAt: "" };
+      }
+    }));
+    // Newest first
+    fileInfos.sort((a, b) => new Date(b.modifiedAt).getTime() - new Date(a.modifiedAt).getTime());
+    const sizeMb = fileInfos[0]?.sizeMb ?? 0;
+    totalWasteMb += sizeMb * (fileInfos.length - 1);
+    groups.push({ hash, sizeMb, files: fileInfos });
+  }
+
+  // Biggest waste first
+  groups.sort((a, b) => (b.sizeMb * (b.files.length - 1)) - (a.sizeMb * (a.files.length - 1)));
+
+  return { groups, totalWasteMb, scannedCount: allFiles.length };
+}
+
+export function deleteDuplicateFiles(paths: string[]): { freedMb: number; errors: string[] } {
+  const errors: string[] = [];
+  let freedMb = 0;
+  for (const filePath of paths) {
+    try {
+      if (!fs.existsSync(filePath)) continue;
+      const stat = fs.statSync(filePath);
+      freedMb += stat.size / (1024 * 1024);
+      fs.unlinkSync(filePath);
+    } catch (e) {
+      errors.push(`Could not delete ${path.basename(filePath)}: ${String(e)}`);
+    }
+  }
   return { freedMb, errors };
 }
