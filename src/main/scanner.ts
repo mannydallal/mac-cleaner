@@ -1055,6 +1055,24 @@ const MAC_SYSTEM_BLOCKLIST = new Set([
   "Automator", "Script Editor", "Grapher", "Image Capture", "ColorSync Utility",
 ]);
 
+const LINUX_SYSTEM_BLOCKLIST = new Set([
+  "bash", "coreutils", "util-linux", "mount", "apt", "apt-utils", "dpkg",
+  "libc6", "libc-bin", "libc6-dev", "libgcc1", "libgcc-s1",
+  "systemd", "systemd-sysv", "udev", "dbus", "dbus-x11",
+  "libsystemd0", "libpam-runtime", "libpam-modules", "libpam-modules-bin",
+  "passwd", "sudo", "adduser", "login", "base-files", "base-passwd",
+  "sysvinit-utils", "init-system-helpers", "sysfsutils",
+  "linux-base", "linux-image-generic", "linux-headers-generic",
+  "grub-common", "grub-pc", "grub-pc-bin", "grub2-common",
+  "openssl", "ca-certificates", "libssl3", "libssl1.1", "libssl-dev",
+  "gzip", "tar", "grep", "sed", "gawk", "diffutils", "findutils",
+  "procps", "hostname", "iproute2", "iptables", "netbase",
+  "gnupg", "gnupg2", "gpgv", "apt-transport-https",
+  "python3", "python3-minimal", "python3.10", "python3.11",
+  "perl", "perl-base", "perl-modules",
+  "lsb-base", "lsb-release",
+]);
+
 async function getMacAppInfoV2(appPath: string): Promise<{ bundleId: string; version: string; publisher: string }> {
   try {
     const plistPath = path.join(appPath, "Contents", "Info.plist");
@@ -1193,6 +1211,102 @@ async function scanAppsFromRegistry(): Promise<AppInfoV2[]> {
   return results.sort((a, b) => b.sizeMb - a.sizeMb);
 }
 
+async function scanLinuxApps(
+  onProgress?: (scanned: number, total: number, currentName: string) => void,
+): Promise<AppInfoV2[]> {
+  const results: AppInfoV2[] = [];
+
+  // ── dpkg / apt (Debian, Ubuntu, Mint, etc.) ────────────────────────────────
+  try {
+    const { stdout: dpkgOut } = await execAsync(
+      "dpkg-query -W -f='${Package}|${Version}|${Installed-Size}|${Maintainer}\\n' 2>/dev/null",
+      { timeout: 15000 },
+    );
+    const lines = dpkgOut.trim().split("\n").filter(Boolean);
+    onProgress?.(0, lines.length, "Reading dpkg packages…");
+    let scanned = 0;
+    for (const line of lines) {
+      const [pkg, version, sizeKbRaw, publisher] = line.split("|");
+      if (!pkg) continue;
+      const name = pkg.trim();
+      scanned++;
+      onProgress?.(scanned, lines.length, name);
+      const sizeMb = parseFloat(sizeKbRaw ?? "0") / 1024;
+      results.push({
+        name,
+        appPath: `/var/lib/dpkg/info/${name}.list`,
+        bundleId: "",
+        version: version?.trim() ?? "",
+        publisher: publisher?.trim().replace(/\s+/g, " ").substring(0, 60) ?? "",
+        sizeMb,
+        associatedPaths: [],
+        associatedSizeMb: 0,
+        uninstallString: `sudo apt-get remove -y ${name}`,
+        quietUninstallString: `sudo dpkg -r ${name}`,
+        isMsi: false,
+        msiGuid: "",
+        isSystemApp: LINUX_SYSTEM_BLOCKLIST.has(name),
+      });
+    }
+  } catch { /* dpkg not available */ }
+
+  // ── Snap packages ──────────────────────────────────────────────────────────
+  try {
+    const { stdout: snapOut } = await execAsync("snap list --unicode=never 2>/dev/null", { timeout: 10000 });
+    for (const line of snapOut.trim().split("\n").slice(1)) {
+      const parts = line.split(/\s+/);
+      const name = parts[0];
+      if (!name || name === "Name") continue;
+      results.push({
+        name,
+        appPath: `/snap/${name}/current`,
+        bundleId: "",
+        version: parts[1] ?? "",
+        publisher: parts[4] ?? "snapcraft",
+        sizeMb: 0,
+        associatedPaths: [],
+        associatedSizeMb: 0,
+        uninstallString: `snap remove ${name}`,
+        quietUninstallString: `snap remove ${name}`,
+        isMsi: false,
+        msiGuid: "",
+        isSystemApp: name === "core" || name === "snapd" || name === "bare",
+      });
+    }
+  } catch { /* snap not available */ }
+
+  // ── Flatpak ────────────────────────────────────────────────────────────────
+  try {
+    const { stdout: fpOut } = await execAsync(
+      "flatpak list --columns=name,application,version 2>/dev/null",
+      { timeout: 10000 },
+    );
+    for (const line of fpOut.trim().split("\n")) {
+      const parts = line.split("\t");
+      const name  = parts[0]?.trim();
+      const appId = parts[1]?.trim();
+      if (!name || !appId) continue;
+      results.push({
+        name,
+        appPath: appId,
+        bundleId: appId,
+        version: parts[2]?.trim() ?? "",
+        publisher: "",
+        sizeMb: 0,
+        associatedPaths: [],
+        associatedSizeMb: 0,
+        uninstallString: `flatpak uninstall -y ${appId}`,
+        quietUninstallString: `flatpak uninstall -y ${appId}`,
+        isMsi: false,
+        msiGuid: "",
+        isSystemApp: false,
+      });
+    }
+  } catch { /* flatpak not available */ }
+
+  return results.sort((a, b) => (b.sizeMb + b.associatedSizeMb) - (a.sizeMb + a.associatedSizeMb));
+}
+
 export async function scanAppsV2(
   onProgress?: (scanned: number, total: number, currentName: string) => void,
 ): Promise<AppInfoV2[]> {
@@ -1201,6 +1315,11 @@ export async function scanAppsV2(
     const res = await scanAppsFromRegistry();
     onProgress?.(1, 1, "Done");
     return res;
+  }
+
+  if (process.platform === "linux") {
+    onProgress?.(0, 1, "Scanning Linux packages…");
+    return scanLinuxApps(onProgress);
   }
 
   if (process.platform !== "darwin") return [];

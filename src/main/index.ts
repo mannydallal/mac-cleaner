@@ -276,6 +276,19 @@ ipcMain.handle("uninstall-app-v2", async (_event, appInfo: AppInfoV2) => {
     }
   }
 
+  if (process.platform === "linux") {
+    const cmd = appInfo.quietUninstallString || appInfo.uninstallString;
+    if (!cmd) {
+      return { freedMb: 0, errors: [`No uninstall command found for ${appInfo.name}`], method: "none" };
+    }
+    try {
+      await execAsync(cmd, { timeout: 120000 });
+      return { freedMb: appInfo.sizeMb, errors: [], method: "linux-package-manager" };
+    } catch (e) {
+      return { freedMb: 0, errors: [String(e)], method: "linux-package-manager" };
+    }
+  }
+
   // Mac — always move to Trash (fully reversible)
   const errors: string[] = [];
   let freedMb = 0;
