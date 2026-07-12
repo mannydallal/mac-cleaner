@@ -1550,8 +1550,8 @@ export default function App() {
                               )}
                             </div>
 
-                            {/* Actions */}
-                            {!app.isSystemApp && platform !== "linux" && (
+                            {/* Actions — Show only on Mac (Windows appPath is a registry key, not a file path) */}
+                            {!app.isSystemApp && platform === "darwin" && (
                               <button
                                 onClick={() => window.cleaner.openPath(app.appPath)}
                                 style={{ background: "rgba(255,255,255,0.05)", border: "none", borderRadius: 6, color: S.muted, fontSize: 11, padding: "4px 8px", cursor: "pointer", flexShrink: 0 }}
