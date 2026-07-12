@@ -4,12 +4,41 @@ import * as os from "os";
 import * as fs from "fs";
 import { promisify } from "util";
 import { exec } from "child_process";
-import { scanSystem, cleanPaths, scanApps, getSizeOf, getDiskHealth, verifyDiskVolume, virusScan, checkFullDiskAccess, getParallelsInfo, listMountedVolumes, findDuplicates, deleteDuplicateFiles, scanUsbDrive, ScanResult, AppInfo } from "./scanner";
+import { scanSystem, cleanPaths, scanApps, scanAppsV2, getSizeOf, getDiskHealth, verifyDiskVolume, virusScan, checkFullDiskAccess, getParallelsInfo, listMountedVolumes, findDuplicates, deleteDuplicateFiles, scanUsbDrive, ScanResult, AppInfo, AppInfoV2 } from "./scanner";
 
 const execAsync = promisify(exec);
 
 let scanCache: ScanResult[] = [];
 let appCache: AppInfo[] = [];
+
+// ── App-list disk cache ───────────────────────────────────────────────────────
+
+type AppCacheFile = {
+  timestamp: number;
+  apps: AppInfo[];
+};
+
+function getAppCachePath(): string {
+  return path.join(app.getPath("userData"), "app-cache.json");
+}
+
+function readAppCacheFile(): AppCacheFile | null {
+  try {
+    const raw = fs.readFileSync(getAppCachePath(), "utf-8");
+    return JSON.parse(raw) as AppCacheFile;
+  } catch {
+    return null;
+  }
+}
+
+function writeAppCacheFile(apps: AppInfo[]): void {
+  try {
+    const data: AppCacheFile = { timestamp: Date.now(), apps };
+    fs.writeFileSync(getAppCachePath(), JSON.stringify(data), "utf-8");
+  } catch {
+    // ignore write errors silently
+  }
+}
 
 function createWindow(): void {
   const win = new BrowserWindow({
@@ -60,8 +89,8 @@ ipcMain.handle("get-parallels-info", async () => {
 });
 
 ipcMain.handle("scan", async (event) => {
-  scanCache = await scanSystem((scanned, total, currentName) => {
-    event.sender.send("scan-progress", scanned, total, currentName);
+  scanCache = await scanSystem((scanned, total, currentName, found) => {
+    event.sender.send("scan-progress", scanned, total, currentName, found);
   });
   return scanCache;
 });
@@ -134,15 +163,22 @@ ipcMain.handle("open-path", async (_event, p: string) => {
   if (fs.existsSync(p)) shell.showItemInFolder(p);
 });
 
+ipcMain.handle("get-cached-apps", async () => {
+  return readAppCacheFile();
+});
+
 ipcMain.handle("scan-apps", async (event) => {
   appCache = await scanApps((scanned, total, currentName) => {
     event.sender.send("scan-apps-progress", scanned, total, currentName);
   });
+  writeAppCacheFile(appCache);
   return appCache;
 });
 
-ipcMain.handle("disk-health", async () => {
-  return await getDiskHealth();
+ipcMain.handle("disk-health", async (event) => {
+  return await getDiskHealth((line) => {
+    event.sender.send("disk-health-progress", line);
+  });
 });
 
 ipcMain.handle("verify-disk", async (event) => {
@@ -208,6 +244,51 @@ ipcMain.handle("uninstall-app", async (_event, appPath: string, associatedPaths:
     }
   }
   return { freedMb, errors };
+});
+
+ipcMain.handle("scan-apps-v2", async (event) => {
+  return await scanAppsV2((scanned, total, currentName) => {
+    event.sender.send("scan-apps-v2-progress", scanned, total, currentName);
+  });
+});
+
+ipcMain.handle("uninstall-app-v2", async (_event, appInfo: AppInfoV2) => {
+  if (process.platform === "win32") {
+    const { uninstallString, quietUninstallString, isMsi, msiGuid, name } = appInfo;
+    try {
+      let cmd = "";
+      if (isMsi && msiGuid) {
+        cmd = `msiexec /x "${msiGuid}" /passive /norestart`;
+      } else if (quietUninstallString) {
+        cmd = quietUninstallString;
+      } else if (uninstallString) {
+        cmd = uninstallString;
+        if (!/\/S\b|\/silent|\/quiet/i.test(cmd)) {
+          if (/uninst|uninstall/i.test(cmd)) cmd += " /S";
+        }
+      } else {
+        return { freedMb: 0, errors: [`No uninstaller found for ${name}`], method: "none" };
+      }
+      await execAsync(cmd, { timeout: 120000 });
+      return { freedMb: appInfo.sizeMb, errors: [], method: "uninstaller" };
+    } catch (e) {
+      return { freedMb: 0, errors: [String(e)], method: "uninstaller" };
+    }
+  }
+
+  // Mac — always move to Trash (fully reversible)
+  const errors: string[] = [];
+  let freedMb = 0;
+  for (const p of [appInfo.appPath, ...appInfo.associatedPaths]) {
+    try {
+      if (!fs.existsSync(p)) continue;
+      freedMb += await getSizeOf(p);
+      await shell.trashItem(p);
+    } catch (e) {
+      errors.push(`Could not move ${path.basename(p)} to Trash: ${String(e)}`);
+    }
+  }
+  return { freedMb, errors, method: "trash" };
 });
 
 ipcMain.handle("scan-usb-drive", async (_event, volPath: string) => {

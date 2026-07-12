@@ -789,7 +789,7 @@ export async function scanExternalDrives(): Promise<ScanResult[]> {
 }
 
 export async function scanSystem(
-  onProgress?: (scanned: number, total: number, currentName: string) => void
+  onProgress?: (scanned: number, total: number, currentName: string, found: number) => void
 ): Promise<ScanResult[]> {
   const platform = process.platform as "darwin" | "win32" | "linux";
   const results: ScanResult[] = [];
@@ -799,7 +799,7 @@ export async function scanSystem(
 
   for (let i = 0; i < targets.length; i++) {
     const target = targets[i];
-    onProgress?.(i, total, target.name);
+    onProgress?.(i, total, target.name, results.length);
     const expanded = expandPath(target.rawPath);
     if (!fs.existsSync(expanded)) continue;
     const { sizeMb, fileCount } = await getFolderSize(expanded);
@@ -814,7 +814,7 @@ export async function scanSystem(
       safe: target.safe,
     });
   }
-  onProgress?.(total, total, "External drives");
+  onProgress?.(total, total, "External drives", results.length);
 
   // Include external drive junk in the full scan
   results.push(...await scanExternalDrives());
@@ -1026,6 +1026,220 @@ export async function getSizeOf(p: string): Promise<number> {
   try { return (await getFolderSize(p)).sizeMb; } catch { return 0; }
 }
 
+// ── Uninstaller v2 ────────────────────────────────────────────────────────────
+
+export type AppInfoV2 = {
+  name: string;
+  appPath: string;
+  bundleId: string;
+  version: string;
+  publisher: string;
+  sizeMb: number;
+  associatedPaths: string[];
+  associatedSizeMb: number;
+  uninstallString: string;
+  quietUninstallString: string;
+  isMsi: boolean;
+  msiGuid: string;
+  isSystemApp: boolean;
+};
+
+const MAC_SYSTEM_BLOCKLIST = new Set([
+  "Finder", "Safari", "Mail", "Messages", "FaceTime", "Maps", "Photos",
+  "Music", "TV", "Podcasts", "News", "Books", "Stocks", "Weather",
+  "Home", "Reminders", "Notes", "Calendar", "Contacts", "Preview",
+  "TextEdit", "Calculator", "Dictionary", "Font Book", "Screenshot",
+  "Stickies", "Time Machine", "Migration Assistant", "Disk Utility",
+  "Activity Monitor", "Console", "Keychain Access", "System Preferences",
+  "System Settings", "Terminal", "Chess", "QuickTime Player", "VoiceOver Utility",
+  "Automator", "Script Editor", "Grapher", "Image Capture", "ColorSync Utility",
+]);
+
+async function getMacAppInfoV2(appPath: string): Promise<{ bundleId: string; version: string; publisher: string }> {
+  try {
+    const plistPath = path.join(appPath, "Contents", "Info.plist");
+    const content = await fs.promises.readFile(plistPath, "utf-8");
+    const bundleIdMatch = content.match(/<key>CFBundleIdentifier<\/key>\s*<string>([^<]+)<\/string>/);
+    const versionMatch  = content.match(/<key>CFBundleShortVersionString<\/key>\s*<string>([^<]+)<\/string>/);
+    const pubMatch      = content.match(/<key>(?:CFBundleGetInfoString|NSHumanReadableCopyright)<\/key>\s*<string>([^<]+)<\/string>/);
+    return {
+      bundleId:  bundleIdMatch?.[1] ?? "",
+      version:   versionMatch?.[1]  ?? "",
+      publisher: (pubMatch?.[1] ?? "").replace(/\s+/g, " ").substring(0, 60),
+    };
+  } catch {
+    return { bundleId: "", version: "", publisher: "" };
+  }
+}
+
+async function findAssociatedPathsV2(cleanName: string, bundleId: string): Promise<string[]> {
+  const home = os.homedir();
+  const found: string[] = [];
+
+  const candidates: string[] = [
+    path.join(home, "Library", "Application Support", cleanName),
+    path.join(home, "Library", "Logs", cleanName),
+    path.join(home, "Library", "Saved Application State", `${bundleId}.savedState`),
+    path.join(home, "Library", "Application Scripts", bundleId),
+    path.join(home, "Library", "HTTPStorages", bundleId),
+    path.join(home, "Library", "HTTPStorages", bundleId + ".hsts"),
+    path.join(home, "Library", "WebKit", bundleId),
+    path.join("/Library", "Application Support", cleanName),
+  ];
+
+  if (bundleId) {
+    candidates.push(
+      path.join(home, "Library", "Caches", bundleId),
+      path.join(home, "Library", "Containers", bundleId),
+      path.join(home, "Library", "Application Support", bundleId),
+    );
+
+    // Group Containers: look for any container whose name starts with the first two bundle segments
+    const groupContainersDir = path.join(home, "Library", "Group Containers");
+    try {
+      const bundlePrefix = bundleId.split(".").slice(0, 2).join(".");
+      const entries = await fs.promises.readdir(groupContainersDir);
+      for (const e of entries) {
+        if (e.startsWith(bundlePrefix)) candidates.push(path.join(groupContainersDir, e));
+      }
+    } catch { /* skip */ }
+
+    // LaunchAgents registered by this app
+    const launchAgentsDir = path.join(home, "Library", "LaunchAgents");
+    try {
+      const entries = await fs.promises.readdir(launchAgentsDir);
+      for (const e of entries) {
+        if (e.startsWith(bundleId) || e.toLowerCase().includes(cleanName.toLowerCase())) {
+          candidates.push(path.join(launchAgentsDir, e));
+        }
+      }
+    } catch { /* skip */ }
+  }
+
+  // Preferences plists
+  const prefsDir = path.join(home, "Library", "Preferences");
+  try {
+    const prefs = (await fs.promises.readdir(prefsDir)).filter(
+      (f) => (bundleId && f.startsWith(bundleId)) || f.toLowerCase().startsWith(cleanName.toLowerCase())
+    );
+    prefs.forEach((f) => candidates.push(path.join(prefsDir, f)));
+  } catch { /* skip */ }
+
+  for (const p of candidates) {
+    try {
+      if (fs.existsSync(p) && !found.includes(p)) found.push(p);
+    } catch { /* skip */ }
+  }
+  return found;
+}
+
+async function scanAppsFromRegistry(): Promise<AppInfoV2[]> {
+  const results: AppInfoV2[] = [];
+  const seen = new Set<string>();
+
+  const regRoots = [
+    `HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall`,
+    `HKLM\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall`,
+    `HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall`,
+  ];
+
+  for (const root of regRoots) {
+    let subkeys: string[] = [];
+    try {
+      const { stdout } = await execAsync(`reg query "${root}" 2>nul`, { timeout: 15000 });
+      subkeys = stdout.split(/\r?\n/).map(l => l.trim()).filter(l => l.startsWith(root) && l !== root);
+    } catch { continue; }
+
+    for (const key of subkeys) {
+      try {
+        const { stdout } = await execAsync(`reg query "${key}" /v DisplayName /v DisplayVersion /v Publisher /v EstimatedSize /v UninstallString /v QuietUninstallString /v SystemComponent /v ReleaseType 2>nul`, { timeout: 5000 });
+
+        const getVal = (name: string) => {
+          const m = stdout.match(new RegExp(`\\s+${name}\\s+REG_\\w+\\s+(.+)`, 'i'));
+          return m?.[1]?.trim() ?? "";
+        };
+
+        const displayName = getVal("DisplayName");
+        if (!displayName || seen.has(displayName.toLowerCase())) continue;
+        if (getVal("SystemComponent") === "1") continue;
+        const releaseType = getVal("ReleaseType");
+        if (releaseType && /update|servicepack|hotfix/i.test(releaseType)) continue;
+
+        const uninstallString      = getVal("UninstallString");
+        const quietUninstallString = getVal("QuietUninstallString");
+        const version              = getVal("DisplayVersion");
+        const publisher            = getVal("Publisher");
+        const estimatedSizeKb      = parseInt(getVal("EstimatedSize") || "0", 10);
+
+        const isMsi = /msiexec/i.test(uninstallString);
+        let msiGuid = "";
+        if (isMsi) {
+          const g = uninstallString.match(/\{[0-9A-F-]+\}/i);
+          msiGuid = g?.[0] ?? "";
+        }
+
+        seen.add(displayName.toLowerCase());
+        results.push({
+          name: displayName, appPath: key, bundleId: "", version, publisher,
+          sizeMb: isNaN(estimatedSizeKb) ? 0 : estimatedSizeKb / 1024,
+          associatedPaths: [], associatedSizeMb: 0,
+          uninstallString, quietUninstallString, isMsi, msiGuid,
+          isSystemApp: false,
+        });
+      } catch { continue; }
+    }
+  }
+
+  return results.sort((a, b) => b.sizeMb - a.sizeMb);
+}
+
+export async function scanAppsV2(
+  onProgress?: (scanned: number, total: number, currentName: string) => void,
+): Promise<AppInfoV2[]> {
+  if (process.platform === "win32") {
+    onProgress?.(0, 1, "Reading Windows registry…");
+    const res = await scanAppsFromRegistry();
+    onProgress?.(1, 1, "Done");
+    return res;
+  }
+
+  if (process.platform !== "darwin") return [];
+
+  const appsDirs = ["/Applications", path.join(os.homedir(), "Applications")];
+  const allEntries: { name: string; appPath: string }[] = [];
+  for (const appsDir of appsDirs) {
+    try {
+      const entries = (await fs.promises.readdir(appsDir, { withFileTypes: true }))
+        .filter(e => e.name.endsWith(".app"));
+      for (const e of entries) allEntries.push({ name: e.name, appPath: path.join(appsDir, e.name) });
+    } catch { /* skip */ }
+  }
+
+  const total = allEntries.length;
+  let scanned = 0;
+  const results: AppInfoV2[] = [];
+
+  for (const { name, appPath } of allEntries) {
+    const cleanName = name.replace(/\.app$/, "");
+    onProgress?.(scanned, total, cleanName);
+    const { bundleId, version, publisher } = await getMacAppInfoV2(appPath);
+    const sizeMb = await getDuSizeMb(appPath);
+    const associatedPaths = await findAssociatedPathsV2(cleanName, bundleId);
+    let associatedSizeMb = 0;
+    for (const p of associatedPaths) associatedSizeMb += await getDuSizeMb(p);
+    results.push({
+      name: cleanName, appPath, bundleId, version, publisher,
+      sizeMb, associatedPaths, associatedSizeMb,
+      uninstallString: "", quietUninstallString: "", isMsi: false, msiGuid: "",
+      isSystemApp: MAC_SYSTEM_BLOCKLIST.has(cleanName),
+    });
+    scanned++;
+    onProgress?.(scanned, total, cleanName);
+  }
+
+  return results.sort((a, b) => (b.sizeMb + b.associatedSizeMb) - (a.sizeMb + a.associatedSizeMb));
+}
+
 // ── USB / External drive deep scan ────────────────────────────────────────────
 
 export type UsbDriveFolder = { name: string; path: string; sizeMb: number };
@@ -1120,7 +1334,7 @@ function findBrokenSymlinks(dir: string, maxDepth = 3, maxFound = 100): string[]
   return found;
 }
 
-export async function getDiskHealth(): Promise<DiskHealth> {
+export async function getDiskHealth(onProgress?: (line: string) => void): Promise<DiskHealth> {
   let smartStatus = "Unknown";
   let volumeName = "";
   let fileSystem = "";
@@ -1129,6 +1343,7 @@ export async function getDiskHealth(): Promise<DiskHealth> {
 
   if (process.platform === "darwin") {
     // ── Mac: diskutil ──────────────────────────────────────────
+    onProgress?.("Checking SMART status…");
     try {
       const { stdout } = await execAsync("diskutil info /", { timeout: 8000 });
       const smart  = stdout.match(/S\.M\.A\.R\.T\. Status:\s*(.+)/);
@@ -1139,6 +1354,7 @@ export async function getDiskHealth(): Promise<DiskHealth> {
       if (fsLine) fileSystem  = fsLine[1].trim();
     } catch { /* skip */ }
 
+    onProgress?.("Reading volume info…");
     try {
       const { stdout } = await execAsync("df -k /");
       const df = stdout.split("\n")[1].trim().split(/\s+/);
@@ -1152,6 +1368,7 @@ export async function getDiskHealth(): Promise<DiskHealth> {
     let wmicVolumeFailed = false;
 
     // SMART status
+    onProgress?.("Checking SMART status…");
     try {
       const { stdout } = await execAsync("wmic diskdrive get status /value", { timeout: 10000 });
       const match = stdout.match(/Status=(\w+)/i);
@@ -1161,6 +1378,7 @@ export async function getDiskHealth(): Promise<DiskHealth> {
     }
 
     // Volume info for C:
+    onProgress?.("Reading volume info…");
     try {
       const { stdout } = await execAsync(
         'wmic logicaldisk where DeviceID="C:" get Size,FreeSpace,FileSystem,VolumeName /value',
@@ -1193,6 +1411,7 @@ export async function getDiskHealth(): Promise<DiskHealth> {
   }
 
   // ── Broken symlinks (cross-platform) ───────────────────────
+  onProgress?.("Scanning for broken symlinks…");
   const home = os.homedir();
   const symlinkDirs = process.platform === "darwin"
     ? [

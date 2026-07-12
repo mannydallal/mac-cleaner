@@ -91,6 +91,22 @@ export type DuplicateScanResult = {
   scannedCount: number;
 };
 
+export type AppInfoV2 = {
+  name: string;
+  appPath: string;
+  bundleId: string;
+  version: string;
+  publisher: string;
+  sizeMb: number;
+  associatedPaths: string[];
+  associatedSizeMb: number;
+  uninstallString: string;
+  quietUninstallString: string;
+  isMsi: boolean;
+  msiGuid: string;
+  isSystemApp: boolean;
+};
+
 contextBridge.exposeInMainWorld("cleaner", {
   platform: process.platform,
   checkPermission: (): Promise<boolean> => ipcRenderer.invoke("check-permission"),
@@ -100,6 +116,8 @@ contextBridge.exposeInMainWorld("cleaner", {
   clean: (ids: string[]): Promise<CleanResult> => ipcRenderer.invoke("clean", ids),
   getStats: (): Promise<SystemStats> => ipcRenderer.invoke("get-stats"),
   openPath: (path: string): Promise<void> => ipcRenderer.invoke("open-path", path),
+  getCachedApps: (): Promise<{ timestamp: number; apps: AppInfo[] } | null> =>
+    ipcRenderer.invoke("get-cached-apps"),
   scanApps: (): Promise<AppInfo[]> => ipcRenderer.invoke("scan-apps"),
   uninstallApp: (appPath: string, associatedPaths: string[]): Promise<CleanResult> =>
     ipcRenderer.invoke("uninstall-app", appPath, associatedPaths),
@@ -118,11 +136,16 @@ contextBridge.exposeInMainWorld("cleaner", {
     ipcRenderer.invoke("delete-duplicates", paths),
 
   // ── Progress event listeners ────────────────────────────────────────────────
-  onScanProgress: (cb: (scanned: number, total: number, currentName: string) => void) => {
-    const handler = (_e: Electron.IpcRendererEvent, scanned: number, total: number, currentName: string) =>
-      cb(scanned, total, currentName);
+  onScanProgress: (cb: (scanned: number, total: number, currentName: string, found: number) => void) => {
+    const handler = (_e: Electron.IpcRendererEvent, scanned: number, total: number, currentName: string, found: number) =>
+      cb(scanned, total, currentName, found);
     ipcRenderer.on("scan-progress", handler);
     return () => ipcRenderer.off("scan-progress", handler);
+  },
+  onDiskHealthProgress: (cb: (line: string) => void) => {
+    const handler = (_e: Electron.IpcRendererEvent, line: string) => cb(line);
+    ipcRenderer.on("disk-health-progress", handler);
+    return () => ipcRenderer.off("disk-health-progress", handler);
   },
   onVerifyDiskProgress: (cb: (line: string) => void) => {
     const handler = (_e: Electron.IpcRendererEvent, line: string) => cb(line);
@@ -145,5 +168,16 @@ contextBridge.exposeInMainWorld("cleaner", {
       cb(scanned, total, currentName);
     ipcRenderer.on("scan-apps-progress", handler);
     return () => ipcRenderer.off("scan-apps-progress", handler);
+  },
+
+  // ── Uninstaller v2 ──────────────────────────────────────────────────────────
+  scanAppsV2: (): Promise<AppInfoV2[]> => ipcRenderer.invoke("scan-apps-v2"),
+  uninstallAppV2: (appInfo: AppInfoV2): Promise<{ freedMb: number; errors: string[]; method: string }> =>
+    ipcRenderer.invoke("uninstall-app-v2", appInfo),
+  onScanAppsV2Progress: (cb: (scanned: number, total: number, currentName: string) => void) => {
+    const handler = (_e: Electron.IpcRendererEvent, scanned: number, total: number, currentName: string) =>
+      cb(scanned, total, currentName);
+    ipcRenderer.on("scan-apps-v2-progress", handler);
+    return () => ipcRenderer.off("scan-apps-v2-progress", handler);
   },
 });

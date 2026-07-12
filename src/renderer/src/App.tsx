@@ -31,6 +31,22 @@ type AppInfo = {
   associatedSizeMb: number;
 };
 
+type AppInfoV2 = {
+  name: string;
+  appPath: string;
+  bundleId: string;
+  version: string;
+  publisher: string;
+  sizeMb: number;
+  associatedPaths: string[];
+  associatedSizeMb: number;
+  uninstallString: string;
+  quietUninstallString: string;
+  isMsi: boolean;
+  msiGuid: string;
+  isSystemApp: boolean;
+};
+
 type DiskHealth = {
   smartStatus: string;
   volumeName: string;
@@ -81,6 +97,7 @@ declare global {
       clean: (ids: string[]) => Promise<{ freedMb: number; errors: string[] }>;
       getStats: () => Promise<SystemStats>;
       openPath: (path: string) => Promise<void>;
+      getCachedApps: () => Promise<{ timestamp: number; apps: AppInfo[] } | null>;
       scanApps: () => Promise<AppInfo[]>;
       uninstallApp: (appPath: string, associatedPaths: string[]) => Promise<{ freedMb: number; errors: string[] }>;
       diskHealth: () => Promise<DiskHealth>;
@@ -93,10 +110,14 @@ declare global {
       cleanUsbJunk: (paths: string[]) => Promise<{ freedMb: number; errors: string[] }>;
       scanDuplicates: () => Promise<DuplicateScanResult>;
       deleteDuplicates: (paths: string[]) => Promise<{ freedMb: number; errors: string[] }>;
-      onScanProgress: (cb: (scanned: number, total: number, currentName: string) => void) => () => void;
+      onScanProgress: (cb: (scanned: number, total: number, currentName: string, found: number) => void) => () => void;
+      onDiskHealthProgress?: (cb: (line: string) => void) => () => void;
       onVirusScanProgress: (cb: (msg: string, scanned: number) => void) => () => void;
       onScanDuplicatesProgress: (cb: (scanned: number, total: number, phase: "walk" | "hash") => void) => () => void;
       onScanAppsProgress: (cb: (scanned: number, total: number, currentName: string) => void) => () => void;
+      scanAppsV2: () => Promise<AppInfoV2[]>;
+      uninstallAppV2: (appInfo: AppInfoV2) => Promise<{ freedMb: number; errors: string[]; method: string }>;
+      onScanAppsV2Progress: (cb: (scanned: number, total: number, currentName: string) => void) => () => void;
     };
   }
 }
@@ -139,7 +160,7 @@ const S = {
   teal: "#0078A0",
 };
 
-type Tab = "scan-all" | "smart" | "junk" | "privacy" | "parallels" | "external" | "uninstaller" | "repair" | "virus" | "duplicates";
+type Tab = "scan-all" | "smart" | "junk" | "privacy" | "parallels" | "external" | "uninstaller" | "uninstaller-v2" | "repair" | "virus" | "duplicates";
 
 const NAV: { id: Tab; label: string; emoji: string; color: string }[] = [
   { id: "scan-all",    label: "Scan All",        emoji: "⚡", color: "#7030B0" },
@@ -149,7 +170,8 @@ const NAV: { id: Tab; label: string; emoji: string; color: string }[] = [
   { id: "duplicates",  label: "Duplicates",      emoji: "👯", color: "#C06800" },
   { id: "parallels",   label: "Parallels",       emoji: "💻", color: S.purple },
   { id: "external",    label: "External Drives", emoji: "💾", color: S.teal   },
-  { id: "uninstaller", label: "Uninstaller",     emoji: "🗂", color: S.red    },
+  { id: "uninstaller",    label: "Uninstaller",    emoji: "🗂", color: S.red    },
+  { id: "uninstaller-v2", label: "Uninstaller v2", emoji: "🚀", color: "#B03060" },
   { id: "repair",      label: "Disk Health",     emoji: "🔧", color: "#0078A0"},
   { id: "virus",       label: "Virus Scan",      emoji: "🛡", color: "#C42020" },
 ];
@@ -162,6 +184,17 @@ function fmtMb(mb: number): string {
 
 function fmtGb(gb: number): string {
   return gb.toFixed(1) + " GB";
+}
+
+function fmtAge(timestamp: number): string {
+  const secs = Math.floor((Date.now() - timestamp) / 1000);
+  if (secs < 60) return "just now";
+  const mins = Math.floor(secs / 60);
+  if (mins < 60) return `${mins} min ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours} hour${hours !== 1 ? "s" : ""} ago`;
+  const days = Math.floor(hours / 24);
+  return `${days} day${days !== 1 ? "s" : ""} ago`;
 }
 
 // ── Sub-components ────────────────────────────────────────────────────────────
@@ -394,14 +427,26 @@ export default function App() {
   const [appList, setAppList] = useState<AppInfo[]>([]);
   const [loadingApps, setLoadingApps] = useState(false);
   const [appsDone, setAppsDone] = useState(false);
+  const [appsCachedAt, setAppsCachedAt] = useState<number | null>(null);
   const [uninstallingApp, setUninstallingApp] = useState<string | null>(null);
   const [confirmApp, setConfirmApp] = useState<AppInfo | null>(null);
+
+  // Uninstaller v2 state
+  const [appListV2, setAppListV2] = useState<AppInfoV2[]>([]);
+  const [loadingAppsV2, setLoadingAppsV2] = useState(false);
+  const [appsDoneV2, setAppsDoneV2] = useState(false);
+  const [appsProgressV2, setAppsProgressV2] = useState<{ scanned: number; total: number; currentName: string } | null>(null);
+  const [uninstallingAppV2, setUninstallingAppV2] = useState<string | null>(null);
+  const [confirmAppV2, setConfirmAppV2] = useState<AppInfoV2 | null>(null);
 
   // Scan All state
   const [scanningAll, setScanningAll] = useState(false);
   const [scanAllDone, setScanAllDone] = useState(false);
+  const [scanAllError, setScanAllError] = useState<string | null>(null);
   const [fixingAll, setFixingAll] = useState(false);
   const [scanAllVirusPass, setScanAllVirusPass] = useState<string | null>(null);
+  const [scanAllJunkProgress, setScanAllJunkProgress] = useState<{ scanned: number; total: number; name: string; found: number } | null>(null);
+  const [scanAllDiskProgress, setScanAllDiskProgress] = useState<string | null>(null);
 
   // Virus scan state
   const [virusResult, setVirusResult] = useState<VirusScanResult | null>(null);
@@ -471,12 +516,36 @@ export default function App() {
   }, [tab]);
 
   useEffect(() => {
+    if (tab !== "uninstaller" || !window.cleaner) return;
+    if (appsDone || loadingApps) return;
+    window.cleaner.getCachedApps?.().then((cached) => {
+      if (cached && cached.apps.length > 0) {
+        setAppList(cached.apps);
+        setAppsDone(true);
+        setAppsCachedAt(cached.timestamp);
+      }
+    }).catch(() => {});
+  }, [tab]);
+
+  useEffect(() => {
     if (!scanningAll || !window.cleaner) return;
     setScanAllVirusPass(null);
-    const unsub = window.cleaner.onVirusScanProgress((msg) => {
+    setScanAllJunkProgress(null);
+    setScanAllDiskProgress(null);
+    const unsubVirus = window.cleaner.onVirusScanProgress((msg) => {
       setScanAllVirusPass(msg);
     });
-    return () => { unsub(); };
+    const unsubJunk = window.cleaner.onScanProgress?.((scanned, total, currentName, found) => {
+      setScanAllJunkProgress({ scanned, total, name: currentName, found });
+    });
+    const unsubDisk = window.cleaner.onDiskHealthProgress?.((line) => {
+      setScanAllDiskProgress(line);
+    });
+    return () => {
+      unsubVirus();
+      unsubJunk?.();
+      unsubDisk?.();
+    };
   }, [scanningAll]);
 
   const handleScan = useCallback(async () => {
@@ -485,7 +554,7 @@ export default function App() {
     setScanDone(false);
     setScanProgress(null);
     setSelected(new Set());
-    const unsub = window.cleaner.onScanProgress?.((scanned, total, currentName) => {
+    const unsub = window.cleaner.onScanProgress?.((scanned, total, currentName, _found) => {
       setScanProgress({ scanned, total, currentName });
     });
     try {
@@ -526,21 +595,39 @@ export default function App() {
     if (!window.cleaner) return;
     setScanningAll(true);
     setScanAllDone(false);
+    setScanAllError(null);
     setVirusResult(null);
     setDiskHealth(null);
     setScanResults([]);
     setSelected(new Set());
     try {
-      const [junkRes, virusRes, diskRes] = await Promise.all([
+      const [junkSettled, virusSettled, diskSettled] = await Promise.allSettled([
         window.cleaner.scan(),
         window.cleaner.virusScan(),
         window.cleaner.diskHealth(),
       ]);
-      setScanResults(junkRes);
-      setSelected(new Set(junkRes.filter((r) => r.safe).map((r) => r.id)));
-      setScanDone(true);
-      setVirusResult(virusRes);
-      setDiskHealth(diskRes);
+
+      if (junkSettled.status === "fulfilled") {
+        const junkRes = junkSettled.value;
+        setScanResults(junkRes);
+        setSelected(new Set(junkRes.filter((r) => r.safe).map((r) => r.id)));
+        setScanDone(true);
+      }
+      if (virusSettled.status === "fulfilled") {
+        setVirusResult(virusSettled.value);
+      }
+      if (diskSettled.status === "fulfilled") {
+        setDiskHealth(diskSettled.value);
+      }
+
+      const failed: string[] = [];
+      if (junkSettled.status === "rejected") failed.push("junk file scan");
+      if (virusSettled.status === "rejected") failed.push("virus scan");
+      if (diskSettled.status === "rejected") failed.push("disk health check");
+      if (failed.length > 0) {
+        setScanAllError(`One or more scans could not complete: ${failed.join(", ")}. Partial results are shown below.`);
+      }
+
       setScanAllDone(true);
     } finally {
       setScanningAll(false);
@@ -708,6 +795,7 @@ export default function App() {
       const apps = await window.cleaner.scanApps();
       setAppList(apps);
       setAppsDone(true);
+      setAppsCachedAt(Date.now());
     } finally {
       unsub?.();
       setAppsProgress(null);
@@ -730,6 +818,46 @@ export default function App() {
       }
     } finally {
       setUninstallingApp(null);
+    }
+  }, []);
+
+  const handleScanAppsV2 = useCallback(async () => {
+    if (!window.cleaner) return;
+    setLoadingAppsV2(true);
+    setAppsDoneV2(false);
+    setAppsProgressV2(null);
+    const unsub = window.cleaner.onScanAppsV2Progress?.((scanned, total, currentName) => {
+      setAppsProgressV2({ scanned, total, currentName });
+    });
+    try {
+      const apps = await window.cleaner.scanAppsV2();
+      setAppListV2(apps);
+      setAppsDoneV2(true);
+    } finally {
+      unsub?.();
+      setAppsProgressV2(null);
+      setLoadingAppsV2(false);
+    }
+  }, []);
+
+  const handleUninstallV2 = useCallback(async (app: AppInfoV2) => {
+    if (!window.cleaner) return;
+    setConfirmAppV2(null);
+    setUninstallingAppV2(app.appPath);
+    try {
+      const result = await window.cleaner.uninstallAppV2(app);
+      if (result.errors.length > 0) {
+        showToast(`⚠ ${app.name}: ${result.errors[0]}`);
+      } else {
+        setFreedMb((prev) => prev + result.freedMb);
+        setAppListV2((prev) => prev.filter((a) => a.appPath !== app.appPath));
+        const methodMsg = result.method === "trash"
+          ? `Moved to Trash — empty Trash to free ${fmtMb(result.freedMb)}`
+          : `Uninstalled via official uninstaller`;
+        showToast(`✓ ${app.name} removed — ${methodMsg}`);
+      }
+    } finally {
+      setUninstallingAppV2(null);
     }
   }, []);
 
@@ -847,6 +975,64 @@ export default function App() {
         </div>
       )}
 
+      {/* Confirm uninstall v2 dialog */}
+      {confirmAppV2 && (
+        <div style={{
+          position: "fixed", inset: 0, background: "rgba(0,0,0,0.75)", zIndex: 9998,
+          display: "flex", alignItems: "center", justifyContent: "center",
+        }}>
+          <div style={{ background: S.card, borderRadius: 16, padding: 28, width: 420, boxShadow: "0 20px 60px rgba(0,0,0,0.5)" }}>
+            <div style={{ fontSize: 18, fontWeight: 700, color: S.text, marginBottom: 6 }}>
+              Remove {confirmAppV2.name}?
+            </div>
+            {/* Safety badge */}
+            <div style={{
+              display: "inline-block", fontSize: 11, fontWeight: 700, padding: "4px 10px",
+              borderRadius: 20, marginBottom: 12,
+              background: platform === "darwin" ? "#1A8C3820" : "#0060CC20",
+              color: platform === "darwin" ? S.green : S.blue,
+            }}>
+              {platform === "darwin"
+                ? "🛡 Moves to Trash — fully reversible"
+                : confirmAppV2.isMsi
+                  ? "🛡 Uses MSI official uninstaller"
+                  : confirmAppV2.quietUninstallString || confirmAppV2.uninstallString
+                    ? "🛡 Uses app's official uninstaller"
+                    : "⚠ No uninstaller found — removal may be incomplete"}
+            </div>
+            {confirmAppV2.version && (
+              <div style={{ fontSize: 12, color: S.muted, marginBottom: 4 }}>
+                Version {confirmAppV2.version}{confirmAppV2.publisher ? ` · ${confirmAppV2.publisher}` : ""}
+              </div>
+            )}
+            <div style={{ fontSize: 13, color: S.text, background: S.card2, borderRadius: 8, padding: "10px 14px", marginBottom: 16 }}>
+              <div style={{ fontWeight: 600, marginBottom: 6, fontSize: 12, color: S.muted }}>Will be removed:</div>
+              <div>• {confirmAppV2.name}{platform === "darwin" ? ".app" : ""} — {fmtMb(confirmAppV2.sizeMb)}</div>
+              {confirmAppV2.associatedPaths.map((p, i) => (
+                <div key={i} style={{ color: S.muted, marginTop: 4, fontSize: 11, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>• {p}</div>
+              ))}
+              {confirmAppV2.associatedPaths.length === 0 && platform === "darwin" && (
+                <div style={{ color: S.muted, marginTop: 4, fontSize: 11 }}>No leftover data found</div>
+              )}
+            </div>
+            <div style={{ display: "flex", gap: 10 }}>
+              <button
+                onClick={() => setConfirmAppV2(null)}
+                style={{ flex: 1, padding: "10px", borderRadius: 9, border: "none", background: "rgba(255,255,255,0.08)", color: S.text, fontSize: 14, cursor: "pointer" }}
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => handleUninstallV2(confirmAppV2)}
+                style={{ flex: 1, padding: "10px", borderRadius: 9, border: "none", background: "#B03060", color: "#fff", fontSize: 14, fontWeight: 700, cursor: "pointer" }}
+              >
+                {platform === "darwin" ? "Move to Trash" : "Uninstall"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Sidebar */}
       <div style={{
         width: 220, background: S.sidebar, display: "flex", flexDirection: "column",
@@ -904,6 +1090,11 @@ export default function App() {
             {isUninstallerTab && appsDone && (
               <div style={{ fontSize: 13, color: S.muted, marginTop: 3 }}>
                 {appList.length} apps found · {fmtMb(appList.reduce((s, a) => s + a.sizeMb + a.associatedSizeMb, 0))} total
+                {appsCachedAt !== null && (
+                  <span style={{ marginLeft: 8, color: S.green, fontStyle: "italic" }}>
+                    · Last scanned {fmtAge(appsCachedAt)}
+                  </span>
+                )}
               </div>
             )}
             {!isUninstallerTab && scanDone && (
@@ -991,6 +1182,22 @@ export default function App() {
                   </button>
                 )}
               </div>
+            ) : tab === "uninstaller-v2" ? (
+              <button
+                onClick={handleScanAppsV2}
+                disabled={loadingAppsV2}
+                style={{
+                  padding: "9px 20px", borderRadius: 10, border: "none",
+                  background: "rgba(255,255,255,0.1)", color: S.text, fontSize: 14, fontWeight: 600,
+                  cursor: loadingAppsV2 ? "not-allowed" : "pointer", opacity: loadingAppsV2 ? 0.6 : 1,
+                }}
+              >
+                {loadingAppsV2
+                  ? (appsProgressV2 && appsProgressV2.total > 0
+                      ? `Scanning ${appsProgressV2.scanned} / ${appsProgressV2.total}…`
+                      : "Scanning…")
+                  : appsDoneV2 ? "↺ Refresh" : "🚀 Scan Apps"}
+              </button>
             ) : isUninstallerTab ? (
               <button
                 onClick={handleScanApps}
@@ -1005,7 +1212,9 @@ export default function App() {
                   ? (appsProgress && appsProgress.total > 0
                       ? `Scanning ${appsProgress.scanned} / ${appsProgress.total}…`
                       : "Scanning…")
-                  : "Scan Apps"}
+                  : appsDone || appsCachedAt !== null
+                    ? "↺ Refresh"
+                    : "Scan Apps"}
               </button>
             ) : isExternalTab ? (
               null
@@ -1059,14 +1268,13 @@ export default function App() {
                 <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "100%", gap: 16 }}>
                   <div style={{ width: 60, height: 60, borderRadius: "50%", border: `4px solid rgba(255,255,255,0.08)`, borderTop: `4px solid ${S.red}`, animation: "spin 0.8s linear infinite" }} />
                   <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
-                  {appsProgress && appsProgress.total > 0 ? (
-                    <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 8, width: 320 }}>
-                      <div style={{ color: S.text, fontSize: 15, fontWeight: 600 }}>
-                        Scanning {appsProgress.scanned} / {appsProgress.total} apps…
-                      </div>
-                      <div style={{ color: S.muted, fontSize: 12, maxWidth: 280, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", textAlign: "center" }}>
-                        {appsProgress.currentName}
-                      </div>
+                  <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 8, width: 320 }}>
+                    <div style={{ color: S.text, fontSize: 15, fontWeight: 600 }}>
+                      {appsProgress && appsProgress.total > 0
+                        ? `Scanning ${appsProgress.scanned} / ${appsProgress.total} apps…`
+                        : "Scanning Applications…"}
+                    </div>
+                    {appsProgress && appsProgress.total > 0 && (
                       <div style={{ width: "100%", height: 6, borderRadius: 3, background: "rgba(255,255,255,0.1)", overflow: "hidden" }}>
                         <div style={{
                           height: "100%",
@@ -1076,10 +1284,11 @@ export default function App() {
                           transition: "width 0.2s ease",
                         }} />
                       </div>
+                    )}
+                    <div style={{ color: S.muted, fontSize: 13, maxWidth: 300, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", textAlign: "center", minHeight: 18 }}>
+                      {appsProgress?.currentName ? `Checking ${appsProgress.currentName}…` : ""}
                     </div>
-                  ) : (
-                    <div style={{ color: S.muted, fontSize: 15 }}>Scanning Applications…</div>
-                  )}
+                  </div>
                 </div>
               )}
               {appsDone && !loadingApps && (
@@ -1094,6 +1303,185 @@ export default function App() {
                     />
                   ))}
                 </div>
+              )}
+            </>
+          )}
+
+          {/* ── Uninstaller v2 tab ── */}
+          {tab === "uninstaller-v2" && (
+            <>
+              {/* Safety banner */}
+              {appsDoneV2 && (
+                <div style={{
+                  display: "flex", alignItems: "center", gap: 10,
+                  background: platform === "darwin" ? "#1A8C3815" : "#0060CC15",
+                  border: `1px solid ${platform === "darwin" ? S.green + "33" : S.blue + "33"}`,
+                  borderRadius: 10, padding: "10px 16px", marginBottom: 16, fontSize: 13,
+                }}>
+                  <span style={{ fontSize: 18 }}>{platform === "darwin" ? "🛡" : "🔧"}</span>
+                  <span style={{ color: platform === "darwin" ? S.green : S.blue, fontWeight: 600 }}>
+                    {platform === "darwin"
+                      ? "All removals move to Trash — reversible anytime. No files are permanently deleted."
+                      : "Windows apps are uninstalled using their own official uninstaller, just like Add/Remove Programs."}
+                  </span>
+                </div>
+              )}
+
+              {!loadingAppsV2 && !appsDoneV2 && (
+                <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "100%", gap: 16 }}>
+                  <div style={{ fontSize: 48 }}>🚀</div>
+                  <div style={{ fontSize: 15, color: S.text, fontWeight: 600 }}>Uninstaller v2</div>
+                  <div style={{ fontSize: 13, color: S.muted, textAlign: "center", maxWidth: 380 }}>
+                    {platform === "darwin"
+                      ? "Scans all installed apps and their leftover data (caches, preferences, containers). All removals go to Trash — fully reversible."
+                      : "Reads the Windows registry to find all installed programs and their official uninstallers — the same list as Add/Remove Programs."}
+                  </div>
+                  <button
+                    onClick={handleScanAppsV2}
+                    style={{
+                      padding: "11px 28px", borderRadius: 10, border: "none",
+                      background: "#B03060", color: "#fff", fontSize: 14, fontWeight: 700, cursor: "pointer",
+                    }}
+                  >
+                    🚀 Scan Apps
+                  </button>
+                </div>
+              )}
+
+              {loadingAppsV2 && (
+                <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "100%", gap: 16 }}>
+                  <div style={{ width: 60, height: 60, borderRadius: "50%", border: `4px solid rgba(255,255,255,0.08)`, borderTop: `4px solid #B03060`, animation: "spin 0.8s linear infinite" }} />
+                  <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
+                  <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 8, width: 320 }}>
+                    <div style={{ color: S.text, fontSize: 15, fontWeight: 600 }}>
+                      {appsProgressV2 && appsProgressV2.total > 0
+                        ? `Scanning ${appsProgressV2.scanned} / ${appsProgressV2.total} apps…`
+                        : platform === "darwin" ? "Scanning Applications…" : "Reading Windows registry…"}
+                    </div>
+                    {appsProgressV2 && appsProgressV2.total > 0 && (
+                      <div style={{ width: "100%", height: 6, borderRadius: 3, background: "rgba(255,255,255,0.1)", overflow: "hidden" }}>
+                        <div style={{
+                          height: "100%", borderRadius: 3, background: "#B03060",
+                          width: `${Math.round((appsProgressV2.scanned / appsProgressV2.total) * 100)}%`,
+                          transition: "width 0.2s ease",
+                        }} />
+                      </div>
+                    )}
+                    <div style={{ color: S.muted, fontSize: 13, maxWidth: 300, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", textAlign: "center", minHeight: 18 }}>
+                      {appsProgressV2?.currentName ? `Checking ${appsProgressV2.currentName}…` : ""}
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {appsDoneV2 && !loadingAppsV2 && (
+                <>
+                  {/* Summary */}
+                  <div style={{
+                    background: S.card, borderRadius: 12, padding: "14px 20px",
+                    marginBottom: 14, display: "flex", alignItems: "center", gap: 24,
+                  }}>
+                    <div>
+                      <span style={{ fontSize: 22, fontWeight: 800, color: S.text }}>
+                        {appListV2.filter(a => !a.isSystemApp).length}
+                      </span>
+                      <span style={{ fontSize: 12, color: S.muted, marginLeft: 6 }}>removable apps</span>
+                    </div>
+                    <div style={{ width: 1, height: 32, background: S.border }} />
+                    <div>
+                      <span style={{ fontSize: 22, fontWeight: 800, color: S.orange }}>
+                        {fmtMb(appListV2.reduce((s, a) => s + a.sizeMb + a.associatedSizeMb, 0))}
+                      </span>
+                      <span style={{ fontSize: 12, color: S.muted, marginLeft: 6 }}>total</span>
+                    </div>
+                    {appListV2.some(a => a.isSystemApp) && (
+                      <>
+                        <div style={{ width: 1, height: 32, background: S.border }} />
+                        <div style={{ fontSize: 12, color: S.muted }}>
+                          {appListV2.filter(a => a.isSystemApp).length} system apps protected
+                        </div>
+                      </>
+                    )}
+                  </div>
+
+                  <div style={{ background: S.card, borderRadius: 14, overflow: "hidden" }}>
+                    {appListV2.map((app) => {
+                      const total = app.sizeMb + app.associatedSizeMb;
+                      const isUninstalling = uninstallingAppV2 === app.appPath;
+                      return (
+                        <div key={app.appPath} style={{
+                          display: "flex", alignItems: "center", gap: 12, padding: "13px 16px",
+                          borderBottom: `1px solid ${S.border}`,
+                          opacity: app.isSystemApp ? 0.55 : 1,
+                        }}>
+                          <div style={{
+                            width: 36, height: 36, borderRadius: 9,
+                            background: app.isSystemApp ? "rgba(0,0,0,0.05)" : "rgba(176,48,96,0.12)",
+                            display: "flex", alignItems: "center", justifyContent: "center",
+                            fontSize: 18, flexShrink: 0,
+                          }}>
+                            {app.isSystemApp ? "🔒" : "🚀"}
+                          </div>
+                          <div style={{ flex: 1, minWidth: 0 }}>
+                            <div style={{ fontSize: 14, color: S.text, fontWeight: 600 }}>
+                              {app.name}
+                              {app.isSystemApp && (
+                                <span style={{
+                                  marginLeft: 8, fontSize: 10, fontWeight: 700,
+                                  padding: "2px 7px", borderRadius: 6,
+                                  background: "rgba(0,0,0,0.06)", color: S.muted,
+                                }}>SYSTEM</span>
+                              )}
+                            </div>
+                            <div style={{ fontSize: 11, color: S.muted, marginTop: 2, display: "flex", alignItems: "center", gap: 6 }}>
+                              {app.version && <span>v{app.version}</span>}
+                              {app.version && app.publisher && <span>·</span>}
+                              {app.publisher && <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 200 }}>{app.publisher}</span>}
+                              {!app.version && !app.publisher && (
+                                <span>
+                                  App: {fmtMb(app.sizeMb)}
+                                  {app.associatedSizeMb > 0.5 && (
+                                    <span style={{ color: S.orange }}> + {fmtMb(app.associatedSizeMb)} leftovers</span>
+                                  )}
+                                </span>
+                              )}
+                            </div>
+                          </div>
+                          <div style={{ textAlign: "right", flexShrink: 0 }}>
+                            <div style={{ fontSize: 14, fontWeight: 700, color: total > 500 ? S.orange : S.text }}>{fmtMb(total)}</div>
+                            {platform === "win32" && (
+                              <div style={{ fontSize: 10, color: S.muted, marginTop: 1 }}>
+                                {app.isMsi ? "MSI" : app.quietUninstallString || app.uninstallString ? "EXE" : "?"}
+                              </div>
+                            )}
+                          </div>
+                          {!app.isSystemApp && (
+                            <button
+                              onClick={() => window.cleaner.openPath(app.appPath)}
+                              style={{ background: "rgba(255,255,255,0.06)", border: "none", borderRadius: 6, color: S.muted, fontSize: 11, padding: "4px 8px", cursor: "pointer", flexShrink: 0 }}
+                            >
+                              Show
+                            </button>
+                          )}
+                          <button
+                            onClick={() => !app.isSystemApp && setConfirmAppV2(app)}
+                            disabled={app.isSystemApp || isUninstalling}
+                            style={{
+                              background: app.isSystemApp ? "rgba(0,0,0,0.04)" : "#B0306022",
+                              border: `1px solid ${app.isSystemApp ? "transparent" : "#B0306044"}`,
+                              borderRadius: 7, color: app.isSystemApp ? S.muted : "#B03060",
+                              fontSize: 12, fontWeight: 600, padding: "5px 12px",
+                              cursor: app.isSystemApp || isUninstalling ? "not-allowed" : "pointer",
+                              flexShrink: 0, opacity: isUninstalling ? 0.5 : 1,
+                            }}
+                          >
+                            {isUninstalling ? "Removing…" : app.isSystemApp ? "Protected" : "Remove"}
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </>
               )}
             </>
           )}
@@ -1417,25 +1805,71 @@ export default function App() {
                     <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
                   </div>
                   <div style={{ fontSize: 17, fontWeight: 700, color: S.text }}>Scanning everything…</div>
-                  <div style={{ display: "flex", flexDirection: "column", gap: 8, alignItems: "center" }}>
-                    {[["🗑", "Junk files"], ["🛡", "Viruses & malware"], ["🔧", "Disk health"], ["🔗", "Broken symlinks"]].map(([emoji, label]) => (
-                      <div key={label} style={{ fontSize: 13, color: S.muted, display: "flex", alignItems: "center", gap: 6 }}>
-                        <span>{emoji}</span> {label}
+                  <div style={{ display: "flex", flexDirection: "column", gap: 10, alignItems: "center", width: "100%", maxWidth: 360 }}>
+                    <style>{`@keyframes pulse { 0%,100%{opacity:0.3} 50%{opacity:1} }`}</style>
+
+                    {/* Junk row */}
+                    <div style={{ width: "100%", textAlign: "center" }}>
+                      <div style={{ fontSize: 13, color: S.muted, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
+                        <span>🗑</span> Junk files
                         <span style={{ width: 8, height: 8, borderRadius: "50%", background: "#7030B0", opacity: 0.6, animation: "pulse 1.2s ease-in-out infinite", display: "inline-block", marginLeft: 4 }} />
-                        <style>{`@keyframes pulse { 0%,100%{opacity:0.3} 50%{opacity:1} }`}</style>
                       </div>
-                    ))}
-                  </div>
-                  {scanAllVirusPass && (
-                    <div style={{ fontSize: 12, color: "#7030B0", background: "rgba(112,48,176,0.1)", borderRadius: 8, padding: "7px 14px", maxWidth: 340, textAlign: "center", lineHeight: 1.5 }}>
-                      🛡 {scanAllVirusPass}
+                      {scanAllJunkProgress && (
+                        <div style={{ fontSize: 11, color: "#7030B0", marginTop: 3, opacity: 0.85 }}>
+                          {scanAllJunkProgress.found > 0 ? `${scanAllJunkProgress.found} item${scanAllJunkProgress.found !== 1 ? "s" : ""} found` : "Checking locations…"}
+                          {" · "}{scanAllJunkProgress.name}
+                        </div>
+                      )}
                     </div>
-                  )}
+
+                    {/* Virus row */}
+                    <div style={{ width: "100%", textAlign: "center" }}>
+                      <div style={{ fontSize: 13, color: S.muted, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
+                        <span>🛡</span> Viruses & malware
+                        <span style={{ width: 8, height: 8, borderRadius: "50%", background: "#7030B0", opacity: 0.6, animation: "pulse 1.2s ease-in-out infinite", display: "inline-block", marginLeft: 4 }} />
+                      </div>
+                      {scanAllVirusPass && (
+                        <div style={{ fontSize: 11, color: "#7030B0", marginTop: 3, opacity: 0.85 }}>
+                          {scanAllVirusPass}
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Disk health row */}
+                    <div style={{ width: "100%", textAlign: "center" }}>
+                      <div style={{ fontSize: 13, color: S.muted, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
+                        <span>🔧</span> Disk health
+                        <span style={{ width: 8, height: 8, borderRadius: "50%", background: "#7030B0", opacity: 0.6, animation: "pulse 1.2s ease-in-out infinite", display: "inline-block", marginLeft: 4 }} />
+                      </div>
+                      {scanAllDiskProgress && (
+                        <div style={{ fontSize: 11, color: "#7030B0", marginTop: 3, opacity: 0.85 }}>
+                          {scanAllDiskProgress}
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Symlinks row */}
+                    <div style={{ fontSize: 13, color: S.muted, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
+                      <span>🔗</span> Broken symlinks
+                      <span style={{ width: 8, height: 8, borderRadius: "50%", background: "#7030B0", opacity: 0.6, animation: "pulse 1.2s ease-in-out infinite", display: "inline-block", marginLeft: 4 }} />
+                    </div>
+                  </div>
                 </div>
               )}
 
               {scanAllDone && !scanningAll && (
                 <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+
+                  {/* Error banner — shown when one or more scans failed */}
+                  {scanAllError && (
+                    <div style={{ background: "#ff3b3018", border: "1px solid #ff3b3044", borderRadius: 14, padding: "14px 20px", display: "flex", alignItems: "flex-start", gap: 12 }}>
+                      <div style={{ fontSize: 22, flexShrink: 0 }}>⚠️</div>
+                      <div>
+                        <div style={{ fontSize: 14, fontWeight: 700, color: "#ff3b30" }}>Scan incomplete</div>
+                        <div style={{ fontSize: 13, color: "#ff3b30", opacity: 0.85, marginTop: 3, lineHeight: 1.5 }}>{scanAllError}</div>
+                      </div>
+                    </div>
+                  )}
 
                   {/* Summary row */}
                   {(() => {
