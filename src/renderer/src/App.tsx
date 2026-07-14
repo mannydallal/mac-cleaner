@@ -455,6 +455,7 @@ export default function App() {
   const [scanAllDone, setScanAllDone] = useState(false);
   const [scanAllError, setScanAllError] = useState<string | null>(null);
   const [fixingAll, setFixingAll] = useState(false);
+  const [scanAllRowStatus, setScanAllRowStatus] = useState<{ junk: "pending" | "ok" | "error"; virus: "pending" | "ok" | "error"; disk: "pending" | "ok" | "error" }>({ junk: "pending", virus: "pending", disk: "pending" });
   const [scanAllVirusPass, setScanAllVirusPass] = useState<string | null>(null);
   const [scanAllJunkProgress, setScanAllJunkProgress] = useState<{ scanned: number; total: number; name: string; found: number } | null>(null);
   const [scanAllDiskProgress, setScanAllDiskProgress] = useState<string | null>(null);
@@ -470,6 +471,15 @@ export default function App() {
   const [verifyOutput, setVerifyOutput] = useState<string | null>(null);
   const [verifying, setVerifying] = useState(false);
   const [fixingSymlinks, setFixingSymlinks] = useState(false);
+  const [lastCleanedAt, setLastCleanedAt] = useState<number | null>(() => {
+    const s = localStorage.getItem("macCleaner_lastCleanedAt");
+    return s ? parseInt(s) : null;
+  });
+  const saveLastCleaned = () => {
+    const now = Date.now();
+    setLastCleanedAt(now);
+    localStorage.setItem("macCleaner_lastCleanedAt", String(now));
+  };
   const [repairing, setRepairing] = useState(false);
   const [repairSteps, setRepairSteps] = useState<{ id: string; label: string; status: "pending"|"running"|"ok"|"warn"|"error"|"skipped"; detail: string }[]>([]);
   const [repairDone, setRepairDone] = useState(false);
@@ -606,6 +616,7 @@ export default function App() {
     try {
       const result = await window.cleaner.clean(Array.from(selected));
       setFreedMb((prev) => prev + result.freedMb);
+      saveLastCleaned();
       const fresh = await window.cleaner.scan();
       setScanResults(fresh);
       setSelected(new Set());
@@ -621,29 +632,46 @@ export default function App() {
     setScanningAll(true);
     setScanAllDone(false);
     setScanAllError(null);
+    setScanAllRowStatus({ junk: "pending", virus: "pending", disk: "pending" });
     setVirusResult(null);
     setDiskHealth(null);
     setScanResults([]);
     setSelected(new Set());
     try {
-      const [junkSettled, virusSettled, diskSettled] = await Promise.allSettled([
-        window.cleaner.scan(),
-        window.cleaner.virusScan(),
-        window.cleaner.diskHealth(),
-      ]);
-
-      if (junkSettled.status === "fulfilled") {
-        const junkRes = junkSettled.value;
-        setScanResults(junkRes);
-        setSelected(new Set(junkRes.filter((r) => r.safe).map((r) => r.id)));
+      const junkPromise = window.cleaner.scan().then((res) => {
+        setScanResults(res);
+        setSelected(new Set(res.filter((r) => r.safe).map((r) => r.id)));
         setScanDone(true);
-      }
-      if (virusSettled.status === "fulfilled") {
-        setVirusResult(virusSettled.value);
-      }
-      if (diskSettled.status === "fulfilled") {
-        setDiskHealth(diskSettled.value);
-      }
+        setScanAllRowStatus((prev) => ({ ...prev, junk: "ok" }));
+        return res;
+      }, (err) => {
+        setScanAllRowStatus((prev) => ({ ...prev, junk: "error" }));
+        throw err;
+      });
+
+      const virusPromise = window.cleaner.virusScan().then((res) => {
+        setVirusResult(res);
+        setScanAllRowStatus((prev) => ({ ...prev, virus: "ok" }));
+        return res;
+      }, (err) => {
+        setScanAllRowStatus((prev) => ({ ...prev, virus: "error" }));
+        throw err;
+      });
+
+      const diskPromise = window.cleaner.diskHealth().then((res) => {
+        setDiskHealth(res);
+        setScanAllRowStatus((prev) => ({ ...prev, disk: "ok" }));
+        return res;
+      }, (err) => {
+        setScanAllRowStatus((prev) => ({ ...prev, disk: "error" }));
+        throw err;
+      });
+
+      const [junkSettled, virusSettled, diskSettled] = await Promise.allSettled([
+        junkPromise,
+        virusPromise,
+        diskPromise,
+      ]);
 
       const failed: string[] = [];
       if (junkSettled.status === "rejected") failed.push("junk file scan");
@@ -667,6 +695,7 @@ export default function App() {
       if (selected.size > 0) {
         const r = await window.cleaner.clean(Array.from(selected));
         setFreedMb((prev) => prev + r.freedMb);
+        saveLastCleaned();
         const fresh = await window.cleaner.scan();
         setScanResults(fresh);
         setSelected(new Set());
@@ -969,6 +998,45 @@ export default function App() {
 
   const diskPct = stats && stats.diskTotalGb > 0 ? Math.round((stats.diskUsedGb / stats.diskTotalGb) * 100) : 0;
   const ramPct = stats ? Math.round((stats.ramUsedGb / stats.ramTotalGb) * 100) : 0;
+
+  // ── Health score (0–100) ──────────────────────────────────────────────────
+  const junkMbForScore = scanDone ? scanResults.reduce((s, r) => s + r.sizeMb, 0) : 0;
+  const healthScore = (() => {
+    let s = 100;
+    // Disk penalty
+    if (diskPct > 95) s -= 25;
+    else if (diskPct > 90) s -= 20;
+    else if (diskPct > 80) s -= 10;
+    else if (diskPct > 70) s -= 5;
+    // RAM penalty
+    if (ramPct > 95) s -= 15;
+    else if (ramPct > 85) s -= 8;
+    else if (ramPct > 75) s -= 3;
+    // CPU penalty
+    if (stats && stats.cpuPercent > 85) s -= 5;
+    else if (stats && stats.cpuPercent > 70) s -= 2;
+    // Junk penalty (only after a scan)
+    if (scanDone) {
+      if (junkMbForScore > 1000) s -= 20;
+      else if (junkMbForScore > 500) s -= 15;
+      else if (junkMbForScore > 100) s -= 10;
+      else if (junkMbForScore > 0) s -= 5;
+    }
+    // Last-cleaned penalty
+    if (lastCleanedAt === null) s -= 15;
+    else {
+      const daysSince = (Date.now() - lastCleanedAt) / 86_400_000;
+      if (daysSince > 30) s -= 10;
+      else if (daysSince > 14) s -= 5;
+      else if (daysSince > 7) s -= 2;
+    }
+    return Math.max(0, Math.min(100, s));
+  })();
+  const healthLabel = healthScore === 100 ? "Perfect ✨" : healthScore >= 90 ? "Excellent" : healthScore >= 75 ? "Good" : healthScore >= 55 ? "Fair" : "Needs Attention";
+  const healthColor = healthScore >= 90 ? S.green : healthScore >= 70 ? S.orange : S.red;
+  // Overdue if never cleaned or cleaned > 30 days ago
+  const cleanOverdue = lastCleanedAt === null || (Date.now() - lastCleanedAt) > 30 * 86_400_000;
+  // ─────────────────────────────────────────────────────────────────────────
 
   const isUninstallerTab = tab === "uninstaller";
   const isRepairTab      = tab === "repair";
@@ -2024,9 +2092,10 @@ export default function App() {
             </>
           )}
 
-          {/* ── Scan All tab ── */}
-          {tab === "scan-all" && (
-            <>
+          {/* ── Scan All tab ── keep mounted (display:none) while scan is running so
+              progress state stays visible when the user switches tabs mid-scan */}
+          {(tab === "scan-all" || scanningAll) && (
+            <div style={{ display: tab === "scan-all" ? undefined : "none" }}>
               {!scanningAll && !scanAllDone && (
                 <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "100%", gap: 20 }}>
                   <div style={{ fontSize: 56 }}>⚡</div>
@@ -2052,9 +2121,15 @@ export default function App() {
                     <div style={{ width: "100%", textAlign: "center" }}>
                       <div style={{ fontSize: 13, color: S.muted, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
                         <span>🗑</span> Junk files
-                        <span style={{ width: 8, height: 8, borderRadius: "50%", background: "#7030B0", opacity: 0.6, animation: "pulse 1.2s ease-in-out infinite", display: "inline-block", marginLeft: 4 }} />
+                        {scanAllRowStatus.junk === "ok" ? (
+                          <span style={{ marginLeft: 4, fontSize: 15, lineHeight: 1 }}>✅</span>
+                        ) : scanAllRowStatus.junk === "error" ? (
+                          <span style={{ marginLeft: 4, fontSize: 15, lineHeight: 1 }} title="Scan failed">❌</span>
+                        ) : (
+                          <span style={{ width: 8, height: 8, borderRadius: "50%", background: "#7030B0", opacity: 0.6, animation: "pulse 1.2s ease-in-out infinite", display: "inline-block", marginLeft: 4 }} />
+                        )}
                       </div>
-                      {scanAllJunkProgress && (
+                      {scanAllJunkProgress && scanAllRowStatus.junk === "pending" && (
                         <div style={{ fontSize: 11, color: "#7030B0", marginTop: 3, opacity: 0.85 }}>
                           {scanAllJunkProgress.found > 0 ? `${scanAllJunkProgress.found} item${scanAllJunkProgress.found !== 1 ? "s" : ""} found` : "Checking locations…"}
                           {" · "}{scanAllJunkProgress.name}
@@ -2063,8 +2138,8 @@ export default function App() {
                       <div style={{ width: "100%", height: 3, background: "rgba(112,48,176,0.15)", borderRadius: 2, marginTop: 6, overflow: "hidden" }}>
                         <div style={{
                           height: "100%",
-                          width: `${scanAllJunkProgress ? Math.min(100, Math.round((scanAllJunkProgress.scanned / Math.max(scanAllJunkProgress.total, 1)) * 100)) : 0}%`,
-                          background: "#7030B0",
+                          width: scanAllRowStatus.junk !== "pending" ? "100%" : `${scanAllJunkProgress ? Math.min(100, Math.round((scanAllJunkProgress.scanned / Math.max(scanAllJunkProgress.total, 1)) * 100)) : 0}%`,
+                          background: scanAllRowStatus.junk === "error" ? S.red : "#7030B0",
                           borderRadius: 2,
                           transition: "width 0.2s ease",
                         }} />
@@ -2074,10 +2149,16 @@ export default function App() {
                     {/* Virus row */}
                     <div style={{ width: "100%", textAlign: "center" }}>
                       <div style={{ fontSize: 13, color: S.muted, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
-                        <span>🛡</span> Viruses & malware
-                        <span style={{ width: 8, height: 8, borderRadius: "50%", background: "#7030B0", opacity: 0.6, animation: "pulse 1.2s ease-in-out infinite", display: "inline-block", marginLeft: 4 }} />
+                        <span>🛡</span> Viruses &amp; malware
+                        {scanAllRowStatus.virus === "ok" ? (
+                          <span style={{ marginLeft: 4, fontSize: 15, lineHeight: 1 }}>✅</span>
+                        ) : scanAllRowStatus.virus === "error" ? (
+                          <span style={{ marginLeft: 4, fontSize: 15, lineHeight: 1 }} title="Scan failed">❌</span>
+                        ) : (
+                          <span style={{ width: 8, height: 8, borderRadius: "50%", background: "#7030B0", opacity: 0.6, animation: "pulse 1.2s ease-in-out infinite", display: "inline-block", marginLeft: 4 }} />
+                        )}
                       </div>
-                      {scanAllVirusPass && (
+                      {scanAllVirusPass && scanAllRowStatus.virus === "pending" && (
                         <div style={{ fontSize: 11, color: "#7030B0", marginTop: 3, opacity: 0.85 }}>
                           {scanAllVirusPass}
                         </div>
@@ -2088,43 +2169,57 @@ export default function App() {
                     <div style={{ width: "100%", textAlign: "center" }}>
                       <div style={{ fontSize: 13, color: S.muted, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
                         <span>🔧</span> Disk health
-                        <span style={{ width: 8, height: 8, borderRadius: "50%", background: "#7030B0", opacity: 0.6, animation: "pulse 1.2s ease-in-out infinite", display: "inline-block", marginLeft: 4 }} />
+                        {scanAllRowStatus.disk === "ok" ? (
+                          <span style={{ marginLeft: 4, fontSize: 15, lineHeight: 1 }}>✅</span>
+                        ) : scanAllRowStatus.disk === "error" ? (
+                          <span style={{ marginLeft: 4, fontSize: 15, lineHeight: 1 }} title="Scan failed">❌</span>
+                        ) : (
+                          <span style={{ width: 8, height: 8, borderRadius: "50%", background: "#7030B0", opacity: 0.6, animation: "pulse 1.2s ease-in-out infinite", display: "inline-block", marginLeft: 4 }} />
+                        )}
                       </div>
-                      {scanAllDiskProgress && (
+                      {scanAllDiskProgress && scanAllRowStatus.disk === "pending" && (
                         <div style={{ fontSize: 11, color: "#7030B0", marginTop: 3, opacity: 0.85 }}>
                           {scanAllDiskProgress}
                         </div>
                       )}
                       {(() => {
                         const line = scanAllDiskProgress ?? "";
-                        const step = line.includes("symlink") ? 3 : line.includes("volume") || line.includes("Volume") ? 2 : line.includes("SMART") ? 1 : 0;
+                        const step = scanAllRowStatus.disk !== "pending" ? 3 : line.includes("symlink") ? 3 : line.includes("volume") || line.includes("Volume") ? 2 : line.includes("SMART") ? 1 : 0;
                         return (
                           <>
                             <div style={{ width: "100%", height: 3, background: "rgba(112,48,176,0.15)", borderRadius: 2, marginTop: 6, overflow: "hidden" }}>
                               <div style={{
                                 height: "100%",
                                 width: `${Math.round((step / 3) * 100)}%`,
-                                background: "#7030B0",
+                                background: scanAllRowStatus.disk === "error" ? S.red : "#7030B0",
                                 borderRadius: 2,
                                 transition: "width 0.4s ease",
                               }} />
                             </div>
-                            <div style={{ display: "flex", justifyContent: "space-between", marginTop: 3 }}>
-                              {["Checking SMART", "Reading volume", "Scanning symlinks"].map((label, i) => (
-                                <span key={label} style={{ fontSize: 9, color: step > i ? "#7030B0" : S.muted, opacity: step > i ? 1 : 0.5, transition: "color 0.3s, opacity 0.3s" }}>
-                                  {label}
-                                </span>
-                              ))}
-                            </div>
+                            {scanAllRowStatus.disk === "pending" && (
+                              <div style={{ display: "flex", justifyContent: "space-between", marginTop: 3 }}>
+                                {["Checking SMART", "Reading volume", "Scanning symlinks"].map((label, i) => (
+                                  <span key={label} style={{ fontSize: 9, color: step > i ? "#7030B0" : S.muted, opacity: step > i ? 1 : 0.5, transition: "color 0.3s, opacity 0.3s" }}>
+                                    {label}
+                                  </span>
+                                ))}
+                              </div>
+                            )}
                           </>
                         );
                       })()}
                     </div>
 
-                    {/* Symlinks row */}
+                    {/* Symlinks row — part of disk health scan */}
                     <div style={{ fontSize: 13, color: S.muted, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
                       <span>🔗</span> Broken symlinks
-                      <span style={{ width: 8, height: 8, borderRadius: "50%", background: "#7030B0", opacity: 0.6, animation: "pulse 1.2s ease-in-out infinite", display: "inline-block", marginLeft: 4 }} />
+                      {scanAllRowStatus.disk === "ok" ? (
+                        <span style={{ marginLeft: 4, fontSize: 15, lineHeight: 1 }}>✅</span>
+                      ) : scanAllRowStatus.disk === "error" ? (
+                        <span style={{ marginLeft: 4, fontSize: 15, lineHeight: 1 }} title="Scan failed">❌</span>
+                      ) : (
+                        <span style={{ width: 8, height: 8, borderRadius: "50%", background: "#7030B0", opacity: 0.6, animation: "pulse 1.2s ease-in-out infinite", display: "inline-block", marginLeft: 4 }} />
+                      )}
                     </div>
                   </div>
                 </div>
@@ -2188,6 +2283,7 @@ export default function App() {
                               if (!window.cleaner || selected.size === 0) return;
                               const r = await window.cleaner.clean(Array.from(selected));
                               setFreedMb(p => p + r.freedMb);
+                              saveLastCleaned();
                               const fresh = await window.cleaner.scan();
                               setScanResults(fresh);
                               setSelected(new Set());
@@ -2282,7 +2378,7 @@ export default function App() {
 
                 </div>
               )}
-            </>
+            </div>
           )}
 
           {/* ── Virus Scan tab ── */}
@@ -2625,70 +2721,73 @@ export default function App() {
                 </div>
               )}
               {!scanning && !scanDone && (
-                <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "100%", gap: 24 }}>
-                  {/* Hero graphic */}
-                  <div style={{ position: "relative", width: 140, height: 140, marginBottom: 8 }}>
-                    <svg viewBox="0 0 140 140" width={140} height={140}>
-                      <defs>
-                        <radialGradient id="glow" cx="50%" cy="50%" r="50%">
-                          <stop offset="0%" stopColor={S.purple} stopOpacity={0.4}/>
-                          <stop offset="100%" stopColor={S.purple} stopOpacity={0}/>
-                        </radialGradient>
-                        <linearGradient id="diskGrad" x1="0%" y1="0%" x2="100%" y2="100%">
-                          <stop offset="0%" stopColor="#9b59f0"/>
-                          <stop offset="100%" stopColor="#5a30d0"/>
-                        </linearGradient>
-                      </defs>
-                      <circle cx="70" cy="70" r="68" fill="url(#glow)"/>
-                      <circle cx="70" cy="70" r="52" fill="none" stroke="rgba(255,255,255,0.05)" strokeWidth="1"/>
-                      <circle cx="70" cy="70" r="36" fill="url(#diskGrad)" opacity="0.9"/>
-                      <circle cx="70" cy="70" r="16" fill="rgba(255,255,255,0.12)"/>
-                      <circle cx="70" cy="70" r="8" fill="rgba(255,255,255,0.25)"/>
-                      {/* Orbit dots */}
-                      <circle cx="70" cy="20" r="4" fill={S.green}/>
-                      <circle cx="118" cy="95" r="3" fill={S.orange}/>
-                      <circle cx="22" cy="95" r="3" fill={S.blue}/>
-                    </svg>
-                  </div>
-                  {statsError && (
-                    <div style={{
-                      background: S.orange + "18", border: `1px solid ${S.orange}44`,
-                      borderRadius: 12, padding: "12px 18px", display: "flex", alignItems: "center", gap: 10, maxWidth: 440,
-                    }}>
-                      <span style={{ fontSize: 18, flexShrink: 0 }}>⚠️</span>
-                      <div style={{ fontSize: 12, color: S.orange, lineHeight: 1.5 }}>
-                        <strong>Could not load system stats</strong><br />{statsError}
+                <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "100%", gap: 20 }}>
+
+                  {/* ── Big health score ring ── */}
+                  {(() => {
+                    const r = 72, circ = 2 * Math.PI * r;
+                    const dash = (healthScore / 100) * circ;
+                    return (
+                      <div style={{ position: "relative", display: "flex", flexDirection: "column", alignItems: "center", gap: 0 }}>
+                        <svg width={180} height={180} viewBox="0 0 180 180">
+                          {/* Glow */}
+                          <circle cx={90} cy={90} r={88} fill="none" stroke={healthColor} strokeWidth={1} opacity={0.12}/>
+                          {/* Track */}
+                          <circle cx={90} cy={90} r={r} fill="none" stroke="rgba(255,255,255,0.07)" strokeWidth={12}/>
+                          {/* Progress arc */}
+                          <circle
+                            cx={90} cy={90} r={r} fill="none" stroke={healthColor} strokeWidth={12}
+                            strokeLinecap="round"
+                            strokeDasharray={`${dash} ${circ}`}
+                            strokeDashoffset={circ / 4}
+                            style={{ transition: "stroke-dasharray 1s ease, stroke 0.5s ease", filter: `drop-shadow(0 0 8px ${healthColor}88)` }}
+                          />
+                          {/* Score number */}
+                          <text x={90} y={82} textAnchor="middle" fill={S.text} fontSize={38} fontWeight={800} fontFamily="-apple-system,sans-serif">
+                            {healthScore}
+                          </text>
+                          {/* / 100 */}
+                          <text x={90} y={100} textAnchor="middle" fill={S.muted} fontSize={13} fontFamily="-apple-system,sans-serif">
+                            / 100
+                          </text>
+                          {/* Label */}
+                          <text x={90} y={120} textAnchor="middle" fill={healthColor} fontSize={15} fontWeight={700} fontFamily="-apple-system,sans-serif">
+                            {healthLabel}
+                          </text>
+                        </svg>
                       </div>
+                    );
+                  })()}
+
+                  {/* Sub-metrics row */}
+                  <div style={{ display: "flex", gap: 24, marginTop: 4 }}>
+                    {[
+                      { label: "Disk", val: `${diskPct}%`, ok: diskPct < 70 },
+                      { label: "RAM",  val: `${ramPct}%`,  ok: ramPct < 75 },
+                      { label: "Freed",val: fmtMb(freedMb), ok: freedMb > 0 },
+                      { label: "Cleaned", val: cleanOverdue ? "Overdue!" : "Up to date", ok: !cleanOverdue },
+                    ].map(({ label, val, ok }) => (
+                      <div key={label} style={{ textAlign: "center" }}>
+                        <div style={{ fontSize: 14, fontWeight: 700, color: ok ? S.green : S.orange }}>{val}</div>
+                        <div style={{ fontSize: 11, color: S.muted, marginTop: 1 }}>{label}</div>
+                      </div>
+                    ))}
+                  </div>
+
+                  {statsError && (
+                    <div style={{ background: S.orange + "18", border: `1px solid ${S.orange}44`, borderRadius: 12, padding: "10px 16px", display: "flex", alignItems: "center", gap: 8, maxWidth: 400 }}>
+                      <span style={{ fontSize: 16, flexShrink: 0 }}>⚠️</span>
+                      <div style={{ fontSize: 12, color: S.orange }}>{statsError}</div>
                     </div>
                   )}
-                  {stats && (
-                    <div style={{ display: "flex", gap: 36, marginBottom: 4 }}>
-                      {stats.diskError ? (
-                        <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 6 }}>
-                          <div style={{
-                            width: 96, height: 96, borderRadius: "50%",
-                            border: `3px dashed ${S.orange}66`,
-                            display: "flex", alignItems: "center", justifyContent: "center",
-                            fontSize: 28,
-                          }}>⚠️</div>
-                          <div style={{ textAlign: "center" }}>
-                            <div style={{ fontSize: 12, fontWeight: 600, color: S.text }}>Disk</div>
-                            <div style={{ fontSize: 10, color: S.orange, maxWidth: 100, lineHeight: 1.4 }}>Could not read disk info — run as administrator</div>
-                          </div>
-                        </div>
-                      ) : (
-                        <StatRing percent={diskPct} label="Disk" color={diskPct > 85 ? S.red : diskPct > 70 ? S.orange : S.green} sub={`${fmtGb(stats.diskUsedGb)} / ${fmtGb(stats.diskTotalGb)}`} />
-                      )}
-                      <StatRing percent={ramPct} label="Memory" color={ramPct > 85 ? S.red : S.blue} sub={`${fmtGb(stats.ramUsedGb)} / ${fmtGb(stats.ramTotalGb)}`} />
-                      <StatRing percent={stats.cpuPercent} label="CPU" color={stats.cpuPercent > 80 ? S.red : S.teal} sub={`${stats.cpuPercent}% used`} />
-                    </div>
-                  )}
+
                   {ramPct > 90 && (
                     <div style={{ fontSize: 12, color: S.orange, background: S.orange + "18", border: `1px solid ${S.orange}44`, borderRadius: 8, padding: "6px 14px" }}>
-                      ⚠ Memory is nearly full — scanning will help find files to free space
+                      ⚠ Memory nearly full — close unused apps to improve score
                     </div>
                   )}
-                  <div style={{ fontSize: 15, color: S.muted }}>
+
+                  <div style={{ fontSize: 14, color: S.muted }}>
                     Click <strong style={{ color: S.text }}>Scan</strong> to find junk files
                   </div>
                 </div>
