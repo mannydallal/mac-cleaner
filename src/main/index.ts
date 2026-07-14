@@ -4,7 +4,7 @@ import * as os from "os";
 import * as fs from "fs";
 import { promisify } from "util";
 import { exec } from "child_process";
-import { scanSystem, cleanPaths, scanApps, scanAppsV2, getSizeOf, getDiskHealth, verifyDiskVolume, virusScan, checkFullDiskAccess, getParallelsInfo, listMountedVolumes, findDuplicates, deleteDuplicateFiles, scanUsbDrive, ScanResult, AppInfo, AppInfoV2 } from "./scanner";
+import { scanSystem, cleanPaths, scanApps, scanAppsV2, getSizeOf, getDiskHealth, verifyDiskVolume, virusScan, checkFullDiskAccess, getParallelsInfo, listMountedVolumes, findDuplicates, deleteDuplicateFiles, scanUsbDrive, runSystemRepairs, ScanResult, AppInfo, AppInfoV2 } from "./scanner";
 
 const execAsync = promisify(exec);
 
@@ -243,6 +243,11 @@ ipcMain.handle("uninstall-app", async (_event, appPath: string, associatedPaths:
       errors.push(`Could not trash ${path.basename(p)}: ${String(e)}`);
     }
   }
+  if (errors.length === 0) {
+    const source = appCache.length > 0 ? appCache : (readAppCacheFile()?.apps ?? []);
+    appCache = source.filter((a) => a.appPath !== appPath);
+    writeAppCacheFile(appCache);
+  }
   return { freedMb, errors };
 });
 
@@ -301,11 +306,22 @@ ipcMain.handle("uninstall-app-v2", async (_event, appInfo: AppInfoV2) => {
       errors.push(`Could not move ${path.basename(p)} to Trash: ${String(e)}`);
     }
   }
+  if (errors.length === 0) {
+    const source = appCache.length > 0 ? appCache : (readAppCacheFile()?.apps ?? []);
+    appCache = source.filter((a) => a.appPath !== appInfo.appPath);
+    writeAppCacheFile(appCache);
+  }
   return { freedMb, errors, method: "trash" };
 });
 
 ipcMain.handle("scan-usb-drive", async (_event, volPath: string) => {
   return await scanUsbDrive(volPath);
+});
+
+ipcMain.handle("run-system-repairs", async (event) => {
+  return await runSystemRepairs((step) => {
+    event.sender.send("repair-step", step);
+  });
 });
 
 ipcMain.handle("clean-usb-junk", async (_event, paths: string[]) => {

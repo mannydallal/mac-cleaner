@@ -2135,3 +2135,196 @@ export function deleteDuplicateFiles(paths: string[]): { freedMb: number; errors
   }
   return { freedMb, errors };
 }
+
+// ── System Repair ─────────────────────────────────────────────────────────────
+
+export type RepairStep = {
+  id: string;
+  label: string;
+  status: "pending" | "running" | "ok" | "warn" | "error" | "skipped";
+  detail: string;
+};
+
+export type RepairReport = {
+  steps: RepairStep[];
+  fixedCount: number;
+  errorCount: number;
+};
+
+async function tryExec(cmd: string, timeoutMs = 60000): Promise<{ ok: boolean; out: string }> {
+  try {
+    const { stdout, stderr } = await execAsync(cmd, { timeout: timeoutMs });
+    return { ok: true, out: (stdout + stderr).trim() };
+  } catch (e: unknown) {
+    const err = e as { stdout?: string; stderr?: string; message?: string };
+    return { ok: false, out: (err.stdout ?? "" + err.stderr ?? "" + err.message ?? "").trim() };
+  }
+}
+
+export async function runSystemRepairs(
+  onStep: (step: RepairStep) => void,
+): Promise<RepairReport> {
+  const steps: RepairStep[] = [];
+  let fixedCount = 0;
+  let errorCount = 0;
+
+  function emit(step: RepairStep) {
+    steps.push(step);
+    onStep(step);
+  }
+
+  function done(id: string, label: string, status: RepairStep["status"], detail: string) {
+    if (status === "ok") fixedCount++;
+    if (status === "error") errorCount++;
+    emit({ id, label, status, detail });
+  }
+
+  // ── macOS ─────────────────────────────────────────────────────────────────
+  if (process.platform === "darwin") {
+
+    emit({ id: "dns", label: "Flush DNS cache", status: "running", detail: "" });
+    const dns = await tryExec("sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder", 15000);
+    done("dns", "Flush DNS cache", dns.ok ? "ok" : "warn",
+      dns.ok ? "DNS cache flushed — resolves intermittent network issues" : `Could not flush DNS (needs admin): ${dns.out.slice(0, 120)}`);
+
+    emit({ id: "fontcache", label: "Rebuild font cache", status: "running", detail: "" });
+    const font = await tryExec("sudo atsutil databases -remove; atsutil server -shutdown; atsutil server -ping", 20000);
+    done("fontcache", "Rebuild font cache", font.ok ? "ok" : "warn",
+      font.ok ? "Font cache rebuilt — fixes rendering glitches" : "Font cache flush skipped (needs admin)");
+
+    emit({ id: "launchservices", label: "Rebuild Launch Services database", status: "running", detail: "" });
+    const ls = await tryExec(
+      "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -kill -r -domain local -domain system -domain user",
+      30000);
+    done("launchservices", "Rebuild Launch Services database", ls.ok ? "ok" : "warn",
+      ls.ok ? "Open With menus and app associations rebuilt" : `Skipped: ${ls.out.slice(0, 100)}`);
+
+    emit({ id: "spotlight", label: "Fix Spotlight index", status: "running", detail: "" });
+    const spot1 = await tryExec("sudo mdutil -E /", 20000);
+    done("spotlight", "Fix Spotlight index", spot1.ok ? "ok" : "warn",
+      spot1.ok ? "Spotlight index erased and re-indexed — search will be accurate" : "Spotlight fix skipped (needs admin)");
+
+    emit({ id: "dyld", label: "Rebuild dynamic linker cache", status: "running", detail: "" });
+    const dyld = await tryExec("sudo update_dyld_shared_cache -force", 30000);
+    done("dyld", "Rebuild dynamic linker cache", dyld.ok ? "ok" : "warn",
+      dyld.ok ? "Dyld cache rebuilt — fixes some app launch failures" : "Skipped (needs admin or not applicable on this macOS version)");
+
+    emit({ id: "diskperms", label: "Verify disk permissions (First Aid)", status: "running", detail: "" });
+    const fa = await tryExec("diskutil verifyVolume /", 60000);
+    const faHasError = /error|fail|corrupt/i.test(fa.out);
+    if (!faHasError) {
+      done("diskperms", "Verify disk permissions (First Aid)", "ok", "Volume structure looks healthy");
+    } else {
+      emit({ id: "diskperms2", label: "Repairing volume errors…", status: "running", detail: "" });
+      const repair = await tryExec("diskutil repairVolume /", 120000);
+      done("diskperms2", "Repair volume (diskutil)", repair.ok ? "ok" : "warn",
+        repair.ok ? "Volume repaired" : `Repair attempted: ${repair.out.slice(0, 150)}`);
+    }
+
+    emit({ id: "homebrew", label: "Check Homebrew integrity", status: "running", detail: "" });
+    const brew = await tryExec("brew doctor 2>&1 | head -20", 30000);
+    const brewOk = brew.ok && /Your system is ready to brew/i.test(brew.out);
+    done("homebrew", "Check Homebrew integrity", brewOk ? "ok" : brew.ok ? "warn" : "skipped",
+      brewOk ? "Homebrew is healthy" : brew.ok ? `Issues found: ${brew.out.slice(0, 150)}` : "Homebrew not installed — skipped");
+
+  // ── Windows ───────────────────────────────────────────────────────────────
+  } else if (process.platform === "win32") {
+
+    emit({ id: "winsock", label: "Reset Winsock (network stack)", status: "running", detail: "" });
+    const ws = await tryExec("netsh winsock reset catalog", 30000);
+    done("winsock", "Reset Winsock (network stack)", ws.ok ? "ok" : "error",
+      ws.ok ? "Winsock reset — fixes many Internet connection problems (reboot recommended)" : ws.out.slice(0, 150));
+
+    emit({ id: "tcpip", label: "Reset TCP/IP stack", status: "running", detail: "" });
+    const tcp = await tryExec("netsh int ip reset", 30000);
+    done("tcpip", "Reset TCP/IP stack", tcp.ok ? "ok" : "warn",
+      tcp.ok ? "TCP/IP stack reset — resolves IP address and routing issues" : tcp.out.slice(0, 150));
+
+    emit({ id: "dns", label: "Flush DNS cache", status: "running", detail: "" });
+    const dns = await tryExec("ipconfig /flushdns", 10000);
+    done("dns", "Flush DNS cache", dns.ok ? "ok" : "warn",
+      dns.ok ? "DNS cache flushed" : dns.out.slice(0, 100));
+
+    emit({ id: "audio", label: "Restart Windows Audio service", status: "running", detail: "" });
+    const aud1 = await tryExec("net stop audiosrv /y", 15000);
+    const aud2 = await tryExec("net start audiosrv", 15000);
+    done("audio", "Restart Windows Audio service", aud2.ok ? "ok" : "warn",
+      aud2.ok ? "Audio service restarted — fixes sound problems" : `Audio service: ${aud2.out.slice(0, 120)}`);
+
+    emit({ id: "wsearch", label: "Restart Windows Search service", status: "running", detail: "" });
+    const ws1 = await tryExec("net stop WSearch /y", 15000);
+    const ws2 = await tryExec("net start WSearch", 15000);
+    done("wsearch", "Restart Windows Search service", ws2.ok ? "ok" : "warn",
+      ws2.ok ? "Windows Search restarted — fixes search not finding files" : `Search service: ${ws2.out.slice(0, 120)}`);
+
+    emit({ id: "winupdate", label: "Reset Windows Update components", status: "running", detail: "" });
+    await tryExec("net stop wuauserv /y", 10000);
+    await tryExec("net stop cryptSvc /y", 10000);
+    await tryExec("net stop bits /y", 10000);
+    const wu = await tryExec("net start wuauserv", 10000);
+    await tryExec("net start cryptSvc", 10000);
+    await tryExec("net start bits", 10000);
+    done("winupdate", "Reset Windows Update components", wu.ok ? "ok" : "warn",
+      wu.ok ? "Windows Update services reset" : "Some services could not restart — may need admin");
+
+    emit({ id: "sfc", label: "Scan system files (SFC)", status: "running", detail: "" });
+    const sfc = await tryExec("sfc /scannow", 300000);
+    const sfcOk = /did not find any integrity violations|no integrity violations/i.test(sfc.out);
+    const sfcFixed = /Windows Resource Protection found corrupt files and successfully repaired/i.test(sfc.out);
+    done("sfc", "Scan & repair system files (SFC)", sfcFixed ? "ok" : sfcOk ? "ok" : "warn",
+      sfcFixed ? "Corrupt system files were found and repaired by SFC" :
+      sfcOk ? "All system files are intact" :
+      `SFC completed — some files may need DISM to repair: ${sfc.out.slice(-200)}`);
+
+    emit({ id: "dism", label: "Repair Windows image (DISM)", status: "running", detail: "" });
+    const dism = await tryExec("DISM /Online /Cleanup-Image /RestoreHealth", 600000);
+    const dismOk = /The restore operation completed successfully|no component store corruption/i.test(dism.out);
+    done("dism", "Repair Windows image (DISM)", dismOk ? "ok" : "warn",
+      dismOk ? "Windows component store is healthy" : `DISM completed: ${dism.out.slice(-200)}`);
+
+  // ── Linux ─────────────────────────────────────────────────────────────────
+  } else if (process.platform === "linux") {
+
+    emit({ id: "dns", label: "Flush DNS cache", status: "running", detail: "" });
+    const dns1 = await tryExec("sudo systemd-resolve --flush-caches", 10000);
+    const dns2 = dns1.ok ? dns1 : await tryExec("sudo /etc/init.d/nscd restart", 10000);
+    done("dns", "Flush DNS cache", (dns1.ok || dns2.ok) ? "ok" : "warn",
+      (dns1.ok || dns2.ok) ? "DNS cache flushed" : "Could not flush DNS (needs admin)");
+
+    emit({ id: "dpkg", label: "Fix broken packages (apt)", status: "running", detail: "" });
+    const dpkg1 = await tryExec("sudo dpkg --configure -a", 60000);
+    const dpkg2 = await tryExec("sudo apt-get install -f -y", 120000);
+    done("dpkg", "Fix broken packages (apt)", (dpkg1.ok && dpkg2.ok) ? "ok" : dpkg1.ok ? "warn" : "warn",
+      (dpkg1.ok && dpkg2.ok) ? "Package database is consistent" :
+      "Some packages could not be fixed automatically (may need manual intervention)");
+
+    emit({ id: "fontcache", label: "Rebuild font cache", status: "running", detail: "" });
+    const font = await tryExec("fc-cache -f -v", 30000);
+    done("fontcache", "Rebuild font cache", font.ok ? "ok" : "warn",
+      font.ok ? "Font cache rebuilt" : "Font cache rebuild skipped");
+
+    emit({ id: "ldconfig", label: "Rebuild shared library cache", status: "running", detail: "" });
+    const ldc = await tryExec("sudo ldconfig", 20000);
+    done("ldconfig", "Rebuild shared library cache", ldc.ok ? "ok" : "warn",
+      ldc.ok ? "Library cache rebuilt — fixes 'shared library not found' errors" : "ldconfig skipped (needs admin)");
+
+    emit({ id: "journal", label: "Vacuum system journal logs", status: "running", detail: "" });
+    const jnl = await tryExec("sudo journalctl --vacuum-size=200M", 20000);
+    done("journal", "Vacuum system journal logs", jnl.ok ? "ok" : "warn",
+      jnl.ok ? "Old journal logs removed — freed space" : "Journal vacuum skipped (needs admin)");
+
+    emit({ id: "fsck", label: "Check filesystem (read-only)", status: "running", detail: "" });
+    const root = await tryExec("df / | tail -1 | awk '{print $1}'", 5000);
+    const device = root.out.trim();
+    if (device) {
+      const fsc = await tryExec(`sudo fsck -n ${device}`, 60000);
+      const fsckOk = /clean|no errors/i.test(fsc.out);
+      done("fsck", "Check filesystem integrity", fsckOk ? "ok" : "warn",
+        fsckOk ? "Filesystem is clean" : `fsck result: ${fsc.out.slice(-200)}`);
+    } else {
+      done("fsck", "Check filesystem integrity", "skipped", "Could not determine root device");
+    }
+  }
+
+  return { steps, fixedCount, errorCount };
+}

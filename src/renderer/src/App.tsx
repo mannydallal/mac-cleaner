@@ -118,9 +118,18 @@ declare global {
       scanAppsV2: () => Promise<AppInfoV2[]>;
       uninstallAppV2: (appInfo: AppInfoV2) => Promise<{ freedMb: number; errors: string[]; method: string }>;
       onScanAppsV2Progress: (cb: (scanned: number, total: number, currentName: string) => void) => () => void;
+      runSystemRepairs: () => Promise<{ steps: RepairStep[]; fixedCount: number; errorCount: number }>;
+      onRepairStep?: (cb: (step: RepairStep) => void) => () => void;
     };
   }
 }
+
+type RepairStep = {
+  id: string;
+  label: string;
+  status: "pending" | "running" | "ok" | "warn" | "error" | "skipped";
+  detail: string;
+};
 
 type DuplicateFile = {
   path: string;
@@ -461,6 +470,10 @@ export default function App() {
   const [verifyOutput, setVerifyOutput] = useState<string | null>(null);
   const [verifying, setVerifying] = useState(false);
   const [fixingSymlinks, setFixingSymlinks] = useState(false);
+  const [repairing, setRepairing] = useState(false);
+  const [repairSteps, setRepairSteps] = useState<{ id: string; label: string; status: "pending"|"running"|"ok"|"warn"|"error"|"skipped"; detail: string }[]>([]);
+  const [repairDone, setRepairDone] = useState(false);
+  const [repairSummary, setRepairSummary] = useState<{ fixedCount: number; errorCount: number } | null>(null);
 
   // External drives state
   const [externalVolumes, setExternalVolumes] = useState<ExternalVolume[]>([]);
@@ -774,6 +787,33 @@ export default function App() {
       setVerifyOutput(out);
     } finally {
       setVerifying(false);
+    }
+  }, []);
+
+  const handleRunRepairs = useCallback(async () => {
+    if (!window.cleaner) return;
+    setRepairing(true);
+    setRepairDone(false);
+    setRepairSteps([]);
+    setRepairSummary(null);
+    const unsub = window.cleaner.onRepairStep?.((step) => {
+      setRepairSteps((prev) => {
+        const idx = prev.findIndex((s) => s.id === step.id);
+        if (idx >= 0) {
+          const next = [...prev];
+          next[idx] = step;
+          return next;
+        }
+        return [...prev, step];
+      });
+    });
+    try {
+      const report = await window.cleaner.runSystemRepairs();
+      setRepairSummary({ fixedCount: report.fixedCount, errorCount: report.errorCount });
+      setRepairDone(true);
+    } finally {
+      unsub?.();
+      setRepairing(false);
     }
   }, []);
 
@@ -1871,9 +1911,112 @@ export default function App() {
                     )}
                   </div>
 
-                  {/* Note */}
-                  <div style={{ fontSize: 12, color: S.muted, textAlign: "center", padding: "4px 0 8px" }}>
-                    For deeper repairs, use Disk Utility → First Aid, or boot into Recovery Mode (⌘+R on startup)
+                  {/* ── System Repair Panel ── */}
+                  <div style={{ background: S.card, borderRadius: 14, overflow: "hidden" }}>
+                    <div style={{ padding: "16px 20px", display: "flex", alignItems: "center", justifyContent: "space-between", borderBottom: repairSteps.length > 0 ? `1px solid ${S.border}` : "none" }}>
+                      <div>
+                        <div style={{ fontSize: 15, fontWeight: 700, color: S.text }}>
+                          🛠 System Repair
+                        </div>
+                        <div style={{ fontSize: 12, color: S.muted, marginTop: 2 }}>
+                          {platform === "darwin"
+                            ? "Flush DNS · Rebuild font cache · Fix Launch Services · Repair volume · Spotlight"
+                            : platform === "win32"
+                              ? "Reset network · Restart Audio & Search · SFC system scan · DISM repair"
+                              : "Fix broken packages · Flush DNS · Rebuild lib cache · Filesystem check"}
+                        </div>
+                      </div>
+                      <button
+                        onClick={handleRunRepairs}
+                        disabled={repairing}
+                        style={{
+                          padding: "8px 18px", borderRadius: 9, border: "none",
+                          background: repairing ? "rgba(255,255,255,0.06)" : "#0060CC",
+                          color: repairing ? S.muted : "#fff",
+                          fontSize: 13, fontWeight: 700,
+                          cursor: repairing ? "not-allowed" : "pointer",
+                          opacity: repairing ? 0.7 : 1, flexShrink: 0,
+                          transition: "all 0.2s",
+                        }}
+                      >
+                        {repairing ? "Repairing…" : repairDone ? "↺ Run Again" : "Run All Repairs"}
+                      </button>
+                    </div>
+
+                    {/* Live step list */}
+                    {repairSteps.length > 0 && (
+                      <div>
+                        {repairSteps.map((step, i) => {
+                          const icon = step.status === "running" ? "⏳"
+                            : step.status === "ok" ? "✅"
+                            : step.status === "warn" ? "⚠️"
+                            : step.status === "error" ? "❌"
+                            : step.status === "skipped" ? "⏭"
+                            : "•";
+                          const color = step.status === "ok" ? S.green
+                            : step.status === "warn" ? S.orange
+                            : step.status === "error" ? S.red
+                            : step.status === "running" ? S.blue
+                            : S.muted;
+                          return (
+                            <div key={step.id} style={{
+                              padding: "11px 20px",
+                              borderBottom: i < repairSteps.length - 1 ? `1px solid ${S.border}` : "none",
+                              display: "flex", alignItems: "flex-start", gap: 12,
+                            }}>
+                              <span style={{ fontSize: 15, flexShrink: 0, marginTop: 1 }}>{icon}</span>
+                              <div style={{ flex: 1, minWidth: 0 }}>
+                                <div style={{ fontSize: 13, fontWeight: 600, color: S.text }}>{step.label}</div>
+                                {step.detail && (
+                                  <div style={{ fontSize: 11, color, marginTop: 3, lineHeight: 1.4, wordBreak: "break-word" }}>
+                                    {step.detail}
+                                  </div>
+                                )}
+                                {step.status === "running" && (
+                                  <div style={{ marginTop: 6, height: 3, borderRadius: 2, background: "rgba(255,255,255,0.08)", overflow: "hidden", width: "100%" }}>
+                                    <div style={{ height: "100%", borderRadius: 2, background: "#0060CC", width: "60%", animation: "indeterminate 1.4s ease infinite" }} />
+                                    <style>{`@keyframes indeterminate { 0%{transform:translateX(-100%)} 100%{transform:translateX(300%)} }`}</style>
+                                  </div>
+                                )}
+                              </div>
+                            </div>
+                          );
+                        })}
+
+                        {/* Summary row */}
+                        {repairDone && repairSummary && (
+                          <div style={{
+                            padding: "14px 20px",
+                            borderTop: `1px solid ${S.border}`,
+                            background: repairSummary.errorCount === 0 ? S.green + "10" : S.orange + "10",
+                            display: "flex", alignItems: "center", gap: 14,
+                          }}>
+                            <span style={{ fontSize: 22 }}>{repairSummary.errorCount === 0 ? "✅" : "⚠️"}</span>
+                            <div>
+                              <div style={{ fontSize: 14, fontWeight: 700, color: repairSummary.errorCount === 0 ? S.green : S.orange }}>
+                                {repairSummary.fixedCount} repair{repairSummary.fixedCount !== 1 ? "s" : ""} completed
+                                {repairSummary.errorCount > 0 ? `, ${repairSummary.errorCount} needed admin rights` : " — all clean"}
+                              </div>
+                              <div style={{ fontSize: 11, color: S.muted, marginTop: 2 }}>
+                                {platform === "win32"
+                                  ? "A reboot is recommended to apply network and system file changes."
+                                  : platform === "darwin"
+                                    ? "Some repairs (DNS, font cache) require admin password — run from Terminal if skipped."
+                                    : "Some repairs require sudo — run from Terminal if skipped."}
+                              </div>
+                            </div>
+                            <button
+                              onClick={() => window.cleaner.diskHealth().then(setDiskHealth)}
+                              style={{
+                                marginLeft: "auto", padding: "6px 14px", borderRadius: 8, border: "none",
+                                background: "rgba(255,255,255,0.08)", color: S.text, fontSize: 12,
+                                fontWeight: 600, cursor: "pointer", flexShrink: 0,
+                              }}
+                            >↺ Re-scan disk</button>
+                          </div>
+                        )}
+                      </div>
+                    )}
                   </div>
 
                 </div>
@@ -1917,6 +2060,15 @@ export default function App() {
                           {" · "}{scanAllJunkProgress.name}
                         </div>
                       )}
+                      <div style={{ width: "100%", height: 3, background: "rgba(112,48,176,0.15)", borderRadius: 2, marginTop: 6, overflow: "hidden" }}>
+                        <div style={{
+                          height: "100%",
+                          width: `${scanAllJunkProgress ? Math.min(100, Math.round((scanAllJunkProgress.scanned / Math.max(scanAllJunkProgress.total, 1)) * 100)) : 0}%`,
+                          background: "#7030B0",
+                          borderRadius: 2,
+                          transition: "width 0.2s ease",
+                        }} />
+                      </div>
                     </div>
 
                     {/* Virus row */}
@@ -1943,6 +2095,30 @@ export default function App() {
                           {scanAllDiskProgress}
                         </div>
                       )}
+                      {(() => {
+                        const line = scanAllDiskProgress ?? "";
+                        const step = line.includes("symlink") ? 3 : line.includes("volume") || line.includes("Volume") ? 2 : line.includes("SMART") ? 1 : 0;
+                        return (
+                          <>
+                            <div style={{ width: "100%", height: 3, background: "rgba(112,48,176,0.15)", borderRadius: 2, marginTop: 6, overflow: "hidden" }}>
+                              <div style={{
+                                height: "100%",
+                                width: `${Math.round((step / 3) * 100)}%`,
+                                background: "#7030B0",
+                                borderRadius: 2,
+                                transition: "width 0.4s ease",
+                              }} />
+                            </div>
+                            <div style={{ display: "flex", justifyContent: "space-between", marginTop: 3 }}>
+                              {["Checking SMART", "Reading volume", "Scanning symlinks"].map((label, i) => (
+                                <span key={label} style={{ fontSize: 9, color: step > i ? "#7030B0" : S.muted, opacity: step > i ? 1 : 0.5, transition: "color 0.3s, opacity 0.3s" }}>
+                                  {label}
+                                </span>
+                              ))}
+                            </div>
+                          </>
+                        );
+                      })()}
                     </div>
 
                     {/* Symlinks row */}

@@ -107,6 +107,19 @@ export type AppInfoV2 = {
   isSystemApp: boolean;
 };
 
+export type RepairStep = {
+  id: string;
+  label: string;
+  status: "pending" | "running" | "ok" | "warn" | "error" | "skipped";
+  detail: string;
+};
+
+export type RepairReport = {
+  steps: RepairStep[];
+  fixedCount: number;
+  errorCount: number;
+};
+
 contextBridge.exposeInMainWorld("cleaner", {
   platform: process.platform,
   checkPermission: (): Promise<boolean> => ipcRenderer.invoke("check-permission"),
@@ -168,6 +181,14 @@ contextBridge.exposeInMainWorld("cleaner", {
       cb(scanned, total, currentName);
     ipcRenderer.on("scan-apps-progress", handler);
     return () => ipcRenderer.off("scan-apps-progress", handler);
+  },
+
+  // ── System Repair ────────────────────────────────────────────────────────────
+  runSystemRepairs: (): Promise<RepairReport> => ipcRenderer.invoke("run-system-repairs"),
+  onRepairStep: (cb: (step: RepairStep) => void) => {
+    const handler = (_e: Electron.IpcRendererEvent, step: RepairStep) => cb(step);
+    ipcRenderer.on("repair-step", handler);
+    return () => ipcRenderer.off("repair-step", handler);
   },
 
   // ── Uninstaller v2 ──────────────────────────────────────────────────────────
