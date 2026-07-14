@@ -2782,9 +2782,37 @@ export default function App() {
                     </div>
                   )}
 
-                  <div style={{ fontSize: 14, color: S.muted }}>
-                    Click <strong style={{ color: S.text }}>Scan</strong> to find junk files
-                  </div>
+                  {/* Reassurance message */}
+                  {healthScore === 100 ? (
+                    <div style={{ textAlign: "center", maxWidth: 320 }}>
+                      <div style={{ fontSize: 15, fontWeight: 700, color: S.green, marginBottom: 4 }}>
+                        Your computer is in perfect condition ✨
+                      </div>
+                      <div style={{ fontSize: 13, color: S.muted, lineHeight: 1.5 }}>
+                        Everything is clean and running great. We'll keep it that way.
+                      </div>
+                    </div>
+                  ) : scanDone && junkMbForScore > 0 ? (
+                    <div style={{ textAlign: "center", maxWidth: 340, background: S.green + "12", border: `1px solid ${S.green}33`, borderRadius: 12, padding: "12px 18px" }}>
+                      <div style={{ fontSize: 14, fontWeight: 700, color: S.green, marginBottom: 4 }}>
+                        Ready to reach 100/100 ✨
+                      </div>
+                      <div style={{ fontSize: 13, color: S.muted, lineHeight: 1.6 }}>
+                        We found <strong style={{ color: S.text }}>{fmtMb(junkMbForScore)}</strong> of junk slowing things down.
+                        Click <strong style={{ color: S.text }}>Clean</strong> — your important files are never touched, only clutter is removed.
+                      </div>
+                    </div>
+                  ) : (
+                    <div style={{ textAlign: "center", maxWidth: 340 }}>
+                      <div style={{ fontSize: 14, fontWeight: 700, color: S.text, marginBottom: 4 }}>
+                        Your score is {healthScore}/100 — let's get you to 100 ✨
+                      </div>
+                      <div style={{ fontSize: 13, color: S.muted, lineHeight: 1.6 }}>
+                        Click <strong style={{ color: S.text }}>Scan</strong> and we'll find what's slowing your computer down.
+                        Nothing will be deleted without your approval — you stay in full control.
+                      </div>
+                    </div>
+                  )}
                 </div>
               )}
               {scanning && (
