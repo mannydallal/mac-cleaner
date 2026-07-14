@@ -691,7 +691,7 @@ export default function App() {
     if (!window.cleaner) return;
     setFixingAll(true);
     try {
-      // 1. Clean junk
+      // 1. Clean junk — skipped if junk scan failed (selected will be empty)
       if (selected.size > 0) {
         const r = await window.cleaner.clean(Array.from(selected));
         setFreedMb((prev) => prev + r.freedMb);
@@ -700,13 +700,13 @@ export default function App() {
         setScanResults(fresh);
         setSelected(new Set());
       }
-      // 2. Fix broken symlinks
+      // 2. Fix broken symlinks — skipped if disk health scan failed (diskHealth is null)
       if (diskHealth && diskHealth.brokenSymlinks.length > 0) {
         await window.cleaner.fixSymlinks(diskHealth.brokenSymlinks);
         const freshDisk = await window.cleaner.diskHealth();
         setDiskHealth(freshDisk);
       }
-      // 3. Quarantine all threats
+      // 3. Quarantine all threats — skipped if virus scan failed (virusResult is null)
       if (virusResult && virusResult.threats.length > 0) {
         for (const t of virusResult.threats) {
           await window.cleaner.quarantineThreat(t.path);
@@ -1015,20 +1015,12 @@ export default function App() {
     // CPU penalty
     if (stats && stats.cpuPercent > 85) s -= 5;
     else if (stats && stats.cpuPercent > 70) s -= 2;
-    // Junk penalty (only after a scan)
+    // Junk penalty (only after a scan — cleared back to 0 once user cleans)
     if (scanDone) {
       if (junkMbForScore > 1000) s -= 20;
       else if (junkMbForScore > 500) s -= 15;
       else if (junkMbForScore > 100) s -= 10;
       else if (junkMbForScore > 0) s -= 5;
-    }
-    // Last-cleaned penalty
-    if (lastCleanedAt === null) s -= 15;
-    else {
-      const daysSince = (Date.now() - lastCleanedAt) / 86_400_000;
-      if (daysSince > 30) s -= 10;
-      else if (daysSince > 14) s -= 5;
-      else if (daysSince > 7) s -= 2;
     }
     return Math.max(0, Math.min(100, s));
   })();
@@ -1044,6 +1036,7 @@ export default function App() {
 
   return (
     <div style={{ display: "flex", height: "100vh", background: S.bgGrad, overflow: "hidden", position: "relative" }}>
+      <style>{`@keyframes fadeInName { from { opacity: 0; } to { opacity: 1; } }`}</style>
 
       {/* Toast */}
       {toast && (
@@ -1272,11 +1265,13 @@ export default function App() {
                 {scanAllDone && (
                   <button
                     onClick={handleFixAll}
-                    disabled={fixingAll}
+                    disabled={fixingAll || !!scanAllError}
+                    title={scanAllError ? "Fix All is unavailable because one or more scans failed" : undefined}
                     style={{
                       padding: "9px 20px", borderRadius: 10, border: "none",
                       background: S.green, color: "#fff", fontSize: 14, fontWeight: 700,
-                      cursor: fixingAll ? "not-allowed" : "pointer", opacity: fixingAll ? 0.6 : 1,
+                      cursor: (fixingAll || !!scanAllError) ? "not-allowed" : "pointer",
+                      opacity: (fixingAll || !!scanAllError) ? 0.4 : 1,
                     }}
                   >
                     {fixingAll ? "Fixing…" : "Fix All Issues"}
@@ -1437,7 +1432,7 @@ export default function App() {
                         }} />
                       </div>
                     )}
-                    <div style={{ color: S.muted, fontSize: 13, maxWidth: 300, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", textAlign: "center", minHeight: 18 }}>
+                    <div key={appsProgress?.currentName} style={{ color: S.muted, fontSize: 13, maxWidth: 300, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", textAlign: "center", minHeight: 18, animation: appsProgress?.currentName ? "fadeInName 0.15s ease forwards" : "none" }}>
                       {appsProgress?.currentName ? `Checking ${appsProgress.currentName}…` : ""}
                     </div>
                   </div>
@@ -1527,7 +1522,7 @@ export default function App() {
                         }} />
                       </div>
                     )}
-                    <div style={{ color: S.muted, fontSize: 13, maxWidth: 320, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", textAlign: "center", minHeight: 18 }}>
+                    <div key={appsProgressV2?.currentName} style={{ color: S.muted, fontSize: 13, maxWidth: 320, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", textAlign: "center", minHeight: 18, animation: appsProgressV2?.currentName ? "fadeInName 0.15s ease forwards" : "none" }}>
                       {appsProgressV2?.currentName ? `Checking ${appsProgressV2.currentName}…` : ""}
                     </div>
                   </div>
