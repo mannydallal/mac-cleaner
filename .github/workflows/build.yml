@@ -18,7 +18,6 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 20
-      
 
       - name: Install dependencies
         run: npm install
@@ -42,7 +41,6 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 20
-  
 
       - name: Install dependencies
         run: npm install
@@ -80,7 +78,8 @@ jobs:
           name: Mac Cleaner v${{ github.run_number }}
           body: |
             ## Download
-            - **Mac**: Download the `.dmg` file → open it → drag Mac Cleaner to Applications
+            - **Mac (Apple Silicon M1/M2/M3)**: Download the `arm64.dmg` file → open it → drag Mac Cleaner to Applications
+            - **Mac (Intel)**: Download the `.dmg` file (without arm64) → open it → drag Mac Cleaner to Applications
             - **Windows** (Parallels): Download the `.exe` file → run the installer
 
             > First time on Mac: right-click the app → Open (bypasses the security warning)
