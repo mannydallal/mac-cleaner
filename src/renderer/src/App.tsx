@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -435,9 +435,11 @@ export default function App() {
   // Uninstaller state
   const [appList, setAppList] = useState<AppInfo[]>([]);
   const [loadingApps, setLoadingApps] = useState(false);
+  const loadingAppsRef = useRef(false);
   const [appsDone, setAppsDone] = useState(false);
   const [appsCachedAt, setAppsCachedAt] = useState<number | null>(null);
   const [bgRefreshing, setBgRefreshing] = useState(false);
+  const bgRefreshIdRef = useRef(0);
   const [uninstallingApp, setUninstallingApp] = useState<string | null>(null);
   const [confirmApp, setConfirmApp] = useState<AppInfo | null>(null);
 
@@ -457,6 +459,7 @@ export default function App() {
   const [fixingAll, setFixingAll] = useState(false);
   const [scanAllRowStatus, setScanAllRowStatus] = useState<{ junk: "pending" | "ok" | "error"; virus: "pending" | "ok" | "error"; disk: "pending" | "ok" | "error" }>({ junk: "pending", virus: "pending", disk: "pending" });
   const [scanAllVirusPass, setScanAllVirusPass] = useState<string | null>(null);
+  const [scanAllVirusScanned, setScanAllVirusScanned] = useState<number>(0);
   const [scanAllJunkProgress, setScanAllJunkProgress] = useState<{ scanned: number; total: number; name: string; found: number } | null>(null);
   const [scanAllDiskProgress, setScanAllDiskProgress] = useState<string | null>(null);
 
@@ -542,7 +545,7 @@ export default function App() {
 
   useEffect(() => {
     if (tab !== "uninstaller" || !window.cleaner) return;
-    if (appsDone || loadingApps) return;
+    if (appsDone || loadingAppsRef.current) return;
     window.cleaner.getCachedApps?.().then((cached) => {
       if (cached && cached.apps.length > 0) {
         setAppList(cached.apps);
@@ -550,12 +553,17 @@ export default function App() {
         setAppsCachedAt(cached.timestamp);
         const ONE_DAY_MS = 24 * 60 * 60 * 1000;
         if (Date.now() - cached.timestamp > ONE_DAY_MS) {
+          if (loadingAppsRef.current) return;
+          const myId = ++bgRefreshIdRef.current;
           setBgRefreshing(true);
           window.cleaner.scanApps().then((freshApps) => {
+            if (bgRefreshIdRef.current !== myId) return;
             setAppList(freshApps);
             setAppsCachedAt(Date.now());
           }).catch(() => {}).finally(() => {
-            setBgRefreshing(false);
+            if (bgRefreshIdRef.current === myId) {
+              setBgRefreshing(false);
+            }
           });
         }
       }
@@ -565,10 +573,12 @@ export default function App() {
   useEffect(() => {
     if (!scanningAll || !window.cleaner) return;
     setScanAllVirusPass(null);
+    setScanAllVirusScanned(0);
     setScanAllJunkProgress(null);
     setScanAllDiskProgress(null);
-    const unsubVirus = window.cleaner.onVirusScanProgress((msg) => {
+    const unsubVirus = window.cleaner.onVirusScanProgress((msg, scanned) => {
       setScanAllVirusPass(msg);
+      setScanAllVirusScanned(scanned);
     });
     const unsubJunk = window.cleaner.onScanProgress?.((scanned, total, currentName, found) => {
       setScanAllJunkProgress({ scanned, total, name: currentName, found });
@@ -866,6 +876,9 @@ export default function App() {
 
   const handleScanApps = useCallback(async () => {
     if (!window.cleaner) return;
+    loadingAppsRef.current = true;
+    bgRefreshIdRef.current++;
+    setBgRefreshing(false);
     setLoadingApps(true);
     setAppsDone(false);
     setAppsProgress(null);
@@ -880,6 +893,7 @@ export default function App() {
     } finally {
       unsub?.();
       setAppsProgress(null);
+      loadingAppsRef.current = false;
       setLoadingApps(false);
     }
   }, []);
@@ -1236,9 +1250,13 @@ export default function App() {
                   </span>
                 )}
                 {bgRefreshing && (
-                  <span style={{ marginLeft: 10, color: S.muted, fontStyle: "italic", opacity: 0.75 }}>
-                    · Updating in background…
-                  </span>
+                  <>
+                    <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
+                    <span style={{ marginLeft: 10, color: S.muted, fontStyle: "italic", opacity: 0.75, display: "inline-flex", alignItems: "center", gap: 5 }}>
+                      <span style={{ display: "inline-block", width: 10, height: 10, borderRadius: "50%", border: "1.5px solid rgba(255,255,255,0.15)", borderTop: "1.5px solid rgba(255,255,255,0.55)", animation: "spin 0.8s linear infinite", flexShrink: 0 }} />
+                      Updating in background…
+                    </span>
+                  </>
                 )}
               </div>
             )}
@@ -2158,6 +2176,15 @@ export default function App() {
                           {scanAllVirusPass}
                         </div>
                       )}
+                      <div style={{ width: "100%", height: 3, background: "rgba(112,48,176,0.15)", borderRadius: 2, marginTop: 6, overflow: "hidden" }}>
+                        <div style={{
+                          height: "100%",
+                          width: scanAllRowStatus.virus !== "pending" ? "100%" : `${Math.min(100, Math.round((scanAllVirusScanned / 500) * 100))}%`,
+                          background: scanAllRowStatus.virus === "error" ? S.red : "#7030B0",
+                          borderRadius: 2,
+                          transition: "width 0.2s ease",
+                        }} />
+                      </div>
                     </div>
 
                     {/* Disk health row */}

@@ -18,7 +18,10 @@ mac:
 
 dmg:
   title: Mac Cleaner
-  background: build/background.png
+  window:
+    size:
+      width: 540
+      height: 380
   contents:
     - x: 410
       y: 150
